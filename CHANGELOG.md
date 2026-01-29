@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-01-29
+
+### Documentation
+
+- Add star history graph to README
+- Add ROADMAP and GitHub Sponsors funding
+- Add downloads and stars badges to README
+- Add Terminal Trove feature mention
+- Fix roadmap links to point to feature requests
+- Add Product Hunt launch kit
+
+
+
 ## [0.1.1] - 2026-01-14
 
 ### Bug Fixes

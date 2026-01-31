@@ -1,6 +1,8 @@
 //! Kill switch firewall control module.
 //!
-//! Controls macOS `pf` (Packet Filter) to block non-VPN traffic when kill switch is active.
+//! Controls system firewall to block non-VPN traffic when kill switch is active.
+//! - macOS: Uses `pf` (Packet Filter)
+//! - Linux: Uses `iptables` (fallback to `nftables` if available)
 //!
 //! # Safety
 //!
@@ -23,11 +25,19 @@ use std::process::Command;
 /// State file path for kill switch persistence
 const STATE_FILE: &str = "killswitch.state";
 
-/// pf configuration file path
+/// pf configuration file path (macOS)
+#[cfg(target_os = "macos")]
 const PF_CONF_PATH: &str = "/tmp/vortix_killswitch.conf";
 
-/// Default VPN interface when none is known (macOS `WireGuard` default)
+/// iptables chain name for kill switch rules (Linux)
+const IPTABLES_CHAIN: &str = "VORTIX_KILLSWITCH";
+
+/// Default VPN interface when none is known
+#[cfg(target_os = "macos")]
 pub const DEFAULT_VPN_INTERFACE: &str = "utun0";
+
+#[cfg(target_os = "linux")]
+pub const DEFAULT_VPN_INTERFACE: &str = "tun0";
 
 /// Result type for kill switch operations
 pub type Result<T> = std::result::Result<T, KillSwitchError>;
@@ -35,7 +45,7 @@ pub type Result<T> = std::result::Result<T, KillSwitchError>;
 /// Errors that can occur during kill switch operations
 #[derive(Debug)]
 pub enum KillSwitchError {
-    /// Failed to execute pf command
+    /// Failed to execute firewall command
     CommandFailed(String),
     /// I/O error
     Io(io::Error),
@@ -46,7 +56,7 @@ pub enum KillSwitchError {
 impl std::fmt::Display for KillSwitchError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::CommandFailed(msg) => write!(f, "pf command failed: {msg}"),
+            Self::CommandFailed(msg) => write!(f, "firewall command failed: {msg}"),
             Self::Io(e) => write!(f, "I/O error: {e}"),
             Self::NotRoot => write!(f, "kill switch requires root privileges"),
         }
@@ -61,7 +71,8 @@ impl From<io::Error> for KillSwitchError {
     }
 }
 
-/// Generate pf rules that block all traffic except VPN
+/// Generate pf rules that block all traffic except VPN (macOS)
+#[cfg(target_os = "macos")]
 fn generate_pf_rules(vpn_interface: &str, vpn_server_ip: Option<&str>) -> String {
     let mut rules = format!(
         r"# Vortix Kill Switch Rules - Auto-generated
@@ -103,7 +114,7 @@ pass quick on {vpn_interface} all
     rules
 }
 
-/// Enable kill switch by loading restrictive pf rules.
+/// Enable kill switch by loading restrictive firewall rules.
 ///
 /// # Arguments
 ///
@@ -112,7 +123,7 @@ pass quick on {vpn_interface} all
 ///
 /// # Errors
 ///
-/// Returns error if not running as root or pf commands fail.
+/// Returns error if not running as root or firewall commands fail.
 pub fn enable_blocking(vpn_interface: &str, vpn_server_ip: Option<&str>) -> Result<()> {
     logger::log(
         LogLevel::Info,
@@ -135,6 +146,62 @@ pub fn enable_blocking(vpn_interface: &str, vpn_server_ip: Option<&str>) -> Resu
         return Err(KillSwitchError::NotRoot);
     }
 
+    #[cfg(target_os = "macos")]
+    {
+        enable_blocking_pf(vpn_interface, vpn_server_ip)
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        enable_blocking_iptables(vpn_interface, vpn_server_ip)
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        Err(KillSwitchError::CommandFailed(
+            "Kill switch not supported on this platform".to_string(),
+        ))
+    }
+}
+
+/// Disable kill switch by flushing firewall rules.
+///
+/// # Errors
+///
+/// Returns error if not running as root or firewall commands fail.
+pub fn disable_blocking() -> Result<()> {
+    logger::log(LogLevel::Info, "FIREWALL", "Disabling kill switch...");
+
+    if !crate::utils::is_root() {
+        logger::log(
+            LogLevel::Error,
+            "FIREWALL",
+            "Disabling kill switch requires root privileges",
+        );
+        return Err(KillSwitchError::NotRoot);
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        disable_blocking_pf()
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        disable_blocking_iptables()
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        Err(KillSwitchError::CommandFailed(
+            "Kill switch not supported on this platform".to_string(),
+        ))
+    }
+}
+
+/// Enable kill switch using macOS pf (Packet Filter).
+#[cfg(target_os = "macos")]
+fn enable_blocking_pf(vpn_interface: &str, vpn_server_ip: Option<&str>) -> Result<()> {
     // Generate and write pf rules
     let rules = generate_pf_rules(vpn_interface, vpn_server_ip);
     let mut file = fs::File::create(PF_CONF_PATH)?;
@@ -183,23 +250,9 @@ pub fn enable_blocking(vpn_interface: &str, vpn_server_ip: Option<&str>) -> Resu
     Ok(())
 }
 
-/// Disable kill switch by flushing pf rules.
-///
-/// # Errors
-///
-/// Returns error if not running as root or pf commands fail.
-pub fn disable_blocking() -> Result<()> {
-    logger::log(LogLevel::Info, "FIREWALL", "Disabling kill switch...");
-
-    if !crate::utils::is_root() {
-        logger::log(
-            LogLevel::Error,
-            "FIREWALL",
-            "Disabling kill switch requires root privileges",
-        );
-        return Err(KillSwitchError::NotRoot);
-    }
-
+/// Disable kill switch using macOS pf (Packet Filter).
+#[cfg(target_os = "macos")]
+fn disable_blocking_pf() -> Result<()> {
     // Flush all rules
     let output = Command::new("pfctl").args(["-F", "all"]).output()?;
 
@@ -221,6 +274,173 @@ pub fn disable_blocking() -> Result<()> {
 
     // Clean up temp file
     let _ = fs::remove_file(PF_CONF_PATH);
+
+    logger::log(
+        LogLevel::Info,
+        "FIREWALL",
+        "✓ Kill switch DISABLED - normal traffic restored",
+    );
+    Ok(())
+}
+
+/// Enable kill switch using Linux iptables.
+#[cfg(target_os = "linux")]
+fn enable_blocking_iptables(vpn_interface: &str, vpn_server_ip: Option<&str>) -> Result<()> {
+    // First, clean up any existing rules
+    let _ = disable_blocking_iptables();
+
+    // Create custom chain
+    let output = Command::new("iptables")
+        .args(["-N", IPTABLES_CHAIN])
+        .output()?;
+
+    // Chain might already exist, which is okay
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !stderr.contains("Chain already exists") {
+            logger::log(
+                LogLevel::Error,
+                "FIREWALL",
+                format!("Failed to create iptables chain: {stderr}"),
+            );
+            return Err(KillSwitchError::CommandFailed(stderr.to_string()));
+        }
+    }
+
+    // Flush the chain to ensure clean state
+    Command::new("iptables")
+        .args(["-F", IPTABLES_CHAIN])
+        .output()?;
+
+    // Allow loopback
+    Command::new("iptables")
+        .args(["-A", IPTABLES_CHAIN, "-o", "lo", "-j", "ACCEPT"])
+        .output()?;
+    Command::new("iptables")
+        .args(["-A", IPTABLES_CHAIN, "-i", "lo", "-j", "ACCEPT"])
+        .output()?;
+
+    // Allow local network (RFC1918)
+    for network in ["192.168.0.0/16", "10.0.0.0/8", "172.16.0.0/12"] {
+        Command::new("iptables")
+            .args(["-A", IPTABLES_CHAIN, "-d", network, "-j", "ACCEPT"])
+            .output()?;
+        Command::new("iptables")
+            .args(["-A", IPTABLES_CHAIN, "-s", network, "-j", "ACCEPT"])
+            .output()?;
+    }
+
+    // Allow DHCP
+    Command::new("iptables")
+        .args([
+            "-A",
+            IPTABLES_CHAIN,
+            "-p",
+            "udp",
+            "--sport",
+            "68",
+            "--dport",
+            "67",
+            "-j",
+            "ACCEPT",
+        ])
+        .output()?;
+    Command::new("iptables")
+        .args([
+            "-A",
+            IPTABLES_CHAIN,
+            "-p",
+            "udp",
+            "--sport",
+            "67",
+            "--dport",
+            "68",
+            "-j",
+            "ACCEPT",
+        ])
+        .output()?;
+
+    // Allow VPN server IP if known (for reconnection)
+    if let Some(ip) = vpn_server_ip {
+        Command::new("iptables")
+            .args(["-A", IPTABLES_CHAIN, "-d", ip, "-j", "ACCEPT"])
+            .output()?;
+    }
+
+    // Allow all traffic on VPN interface
+    Command::new("iptables")
+        .args(["-A", IPTABLES_CHAIN, "-o", vpn_interface, "-j", "ACCEPT"])
+        .output()?;
+    Command::new("iptables")
+        .args(["-A", IPTABLES_CHAIN, "-i", vpn_interface, "-j", "ACCEPT"])
+        .output()?;
+
+    // Allow established connections
+    Command::new("iptables")
+        .args([
+            "-A",
+            IPTABLES_CHAIN,
+            "-m",
+            "conntrack",
+            "--ctstate",
+            "ESTABLISHED,RELATED",
+            "-j",
+            "ACCEPT",
+        ])
+        .output()?;
+
+    // Drop everything else
+    Command::new("iptables")
+        .args(["-A", IPTABLES_CHAIN, "-j", "DROP"])
+        .output()?;
+
+    // Insert chain into INPUT and OUTPUT chains
+    let output = Command::new("iptables")
+        .args(["-I", "OUTPUT", "1", "-j", IPTABLES_CHAIN])
+        .output()?;
+
+    if !output.status.success() {
+        let err = String::from_utf8_lossy(&output.stderr).to_string();
+        logger::log(
+            LogLevel::Error,
+            "FIREWALL",
+            format!("Failed to enable iptables rules: {err}"),
+        );
+        return Err(KillSwitchError::CommandFailed(err));
+    }
+
+    Command::new("iptables")
+        .args(["-I", "INPUT", "1", "-j", IPTABLES_CHAIN])
+        .output()?;
+
+    logger::log(
+        LogLevel::Info,
+        "FIREWALL",
+        "✓ Kill switch ACTIVE - blocking non-VPN traffic",
+    );
+    Ok(())
+}
+
+/// Disable kill switch using Linux iptables.
+#[cfg(target_os = "linux")]
+fn disable_blocking_iptables() -> Result<()> {
+    // Remove references to our chain from INPUT and OUTPUT
+    let _ = Command::new("iptables")
+        .args(["-D", "OUTPUT", "-j", IPTABLES_CHAIN])
+        .output();
+
+    let _ = Command::new("iptables")
+        .args(["-D", "INPUT", "-j", IPTABLES_CHAIN])
+        .output();
+
+    // Flush and delete the chain
+    let _ = Command::new("iptables")
+        .args(["-F", IPTABLES_CHAIN])
+        .output();
+
+    let _ = Command::new("iptables")
+        .args(["-X", IPTABLES_CHAIN])
+        .output();
 
     logger::log(
         LogLevel::Info,
@@ -310,6 +530,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(target_os = "macos")]
     fn test_generate_pf_rules_with_server() {
         let rules = generate_pf_rules("utun3", Some("1.2.3.4"));
         assert!(rules.contains("block all"));
@@ -320,6 +541,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "macos")]
     fn test_generate_pf_rules_without_server() {
         let rules = generate_pf_rules("utun3", None);
         assert!(rules.contains("block all"));

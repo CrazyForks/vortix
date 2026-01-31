@@ -669,13 +669,33 @@ pub struct NetworkStats {
 impl NetworkStats {
     /// Updates network statistics by reading system interface data.
     ///
-    /// Parses `netstat -ib` output on macOS/Unix to calculate network throughput.
-    /// Uses dynamic column detection for robustness across different netstat versions.
+    /// Uses platform-specific methods to get network statistics:
+    /// - macOS: `netstat -ib`
+    /// - Linux: `/proc/net/dev`
     ///
     /// # Returns
     ///
     /// A tuple of (`bytes_down_per_second`, `bytes_up_per_second`).
     pub fn update(&mut self) -> (u64, u64) {
+        #[cfg(target_os = "macos")]
+        {
+            self.update_macos()
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            self.update_linux()
+        }
+
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            (0, 0)
+        }
+    }
+
+    /// Update network stats on macOS using netstat.
+    #[cfg(target_os = "macos")]
+    fn update_macos(&mut self) -> (u64, u64) {
         let mut current_down = 0u64;
         let mut current_up = 0u64;
 
@@ -734,6 +754,68 @@ impl NetworkStats {
                                 total_bytes_out += obytes;
                             }
                         }
+                    }
+                }
+            }
+
+            // Calculate rate (bytes per second since last tick)
+            // First call returns 0 as we're establishing baseline
+            if self.last_bytes_in > 0 {
+                current_down = total_bytes_in.saturating_sub(self.last_bytes_in);
+                current_up = total_bytes_out.saturating_sub(self.last_bytes_out);
+            }
+            self.last_bytes_in = total_bytes_in;
+            self.last_bytes_out = total_bytes_out;
+        }
+
+        (current_down, current_up)
+    }
+
+    /// Update network stats on Linux using /proc/net/dev.
+    #[cfg(target_os = "linux")]
+    fn update_linux(&mut self) -> (u64, u64) {
+        let mut current_down = 0u64;
+        let mut current_up = 0u64;
+
+        // Read /proc/net/dev for network statistics
+        // Format:
+        // Inter-|   Receive                                                |  Transmit
+        //  face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed
+        //     lo:   65536      768    0    0    0     0          0         0    65536      768    0    0    0     0       0          0
+        //   eth0: 1234567      890    0    0    0     0          0         0  7654321      543    0    0    0     0       0          0
+        if let Ok(content) = std::fs::read_to_string("/proc/net/dev") {
+            let mut total_bytes_in: u64 = 0;
+            let mut total_bytes_out: u64 = 0;
+
+            for line in content.lines().skip(2) {
+                // Skip header lines
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+
+                // Split by colon to separate interface name from stats
+                let parts: Vec<&str> = line.split(':').collect();
+                if parts.len() != 2 {
+                    continue;
+                }
+
+                let iface = parts[0].trim();
+                let stats = parts[1].trim();
+
+                // Skip loopback interface
+                if iface == "lo" {
+                    continue;
+                }
+
+                // Parse stats: first number is receive bytes, 9th is transmit bytes
+                let stats_parts: Vec<&str> = stats.split_whitespace().collect();
+                if stats_parts.len() >= 9 {
+                    if let Ok(rx_bytes) = stats_parts[0].parse::<u64>() {
+                        total_bytes_in += rx_bytes;
+                    }
+                    if let Ok(tx_bytes) = stats_parts[8].parse::<u64>() {
+                        total_bytes_out += tx_bytes;
                     }
                 }
             }

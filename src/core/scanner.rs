@@ -190,21 +190,10 @@ fn check_wireguard_by_name(name: &str) -> Option<ActiveSession> {
         }
     }
 
-    // 3. Parse `ifconfig {interface_name}` for IP and MTU
-    if let Ok(output) = Command::new("ifconfig").arg(&interface_name).output() {
-        let out = String::from_utf8_lossy(&output.stdout);
-        for line in out.lines() {
-            let line = line.trim();
-            if line.starts_with("inet ") {
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() >= 2 {
-                    session.internal_ip = parts[1].to_string();
-                }
-            }
-            if let Some(v) = line.split("mtu ").nth(1) {
-                session.mtu = v.to_string();
-            }
-        }
+    // 3. Get interface IP and MTU using cross-platform method
+    if let Some((ip, mtu)) = get_interface_info(&interface_name) {
+        session.internal_ip = ip;
+        session.mtu = mtu;
     }
 
     Some(session)
@@ -307,71 +296,11 @@ fn check_openvpn_by_pid(pid: u32, config_path: &Path) -> ActiveSession {
         }
     }
 
-    // Method B: Fallback to ifconfig scanning
-    if let Ok(output) = Command::new("ifconfig").output() {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let mut current_iface = String::new();
-        let mut found_openvpn_iface = false;
-        let mut iface_mtu = String::new();
-
-        for line in stdout.lines() {
-            // Interface line starts with the interface name (no leading whitespace)
-            if !line.starts_with(' ') && !line.starts_with('\t') {
-                // New interface block
-                if let Some(iface_name) = line.split(':').next() {
-                    current_iface = iface_name.to_string();
-
-                    // If we found the interface via lsof, we strictly look for that
-                    if detected_iface.is_empty() {
-                        // OpenVPN typically uses utun (macOS) or tun (Linux)
-                        found_openvpn_iface = current_iface.starts_with("utun")
-                            || current_iface.starts_with("tun")
-                            || current_iface.starts_with("tap");
-                    } else {
-                        found_openvpn_iface = current_iface == detected_iface;
-                    }
-
-                    // Extract MTU from flags line: "utun3: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1500"
-                    if found_openvpn_iface {
-                        if let Some(mtu_idx) = line.find("mtu ") {
-                            iface_mtu = line[mtu_idx + 4..]
-                                .split_whitespace()
-                                .next()
-                                .unwrap_or("")
-                                .to_string();
-
-                            // If we already know the interface from lsof, we can still use this block to get MTU
-                            if !detected_iface.is_empty() {
-                                session.interface.clone_from(&detected_iface);
-                                session.mtu.clone_from(&iface_mtu);
-                            }
-                        }
-                    }
-                }
-            } else if found_openvpn_iface {
-                let line = line.trim();
-                // Look for inet address
-                if line.starts_with("inet ") {
-                    let parts: Vec<&str> = line.split_whitespace().collect();
-                    if parts.len() >= 2 {
-                        // Verify this isn't a WireGuard interface by checking if wg knows about it
-                        let wg_check = Command::new("wg")
-                            .args(["show", &current_iface])
-                            .stdout(std::process::Stdio::null())
-                            .stderr(std::process::Stdio::null())
-                            .status();
-
-                        // If wg doesn't recognize it, it's likely OpenVPN
-                        if matches!(wg_check, Ok(s) if !s.success()) {
-                            session.internal_ip = parts[1].to_string();
-                            session.mtu.clone_from(&iface_mtu);
-                            session.interface.clone_from(&current_iface);
-                            break;
-                        }
-                    }
-                }
-            }
-        }
+    // Method B: Fallback to scanning all interfaces
+    if let Some((iface, ip, mtu)) = scan_all_interfaces_for_openvpn(&detected_iface) {
+        session.interface = iface;
+        session.internal_ip = ip;
+        session.mtu = mtu;
     }
 
     // Ensure interface is set if we found it via lsof, even if ifconfig didn't show IP yet
@@ -496,4 +425,227 @@ fn parse_ps_etime(etime: &str) -> Option<std::time::Duration> {
     }
 
     Some(Duration::from_secs(seconds))
+}
+
+/// Get interface information (IP address and MTU) using cross-platform commands.
+///
+/// Uses `ip` command on Linux and `ifconfig` on macOS.
+///
+/// # Returns
+///
+/// A tuple of (IP address, MTU) if found, None otherwise.
+fn get_interface_info(interface: &str) -> Option<(String, String)> {
+    #[cfg(target_os = "linux")]
+    {
+        get_interface_info_linux(interface)
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        get_interface_info_macos(interface)
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        None
+    }
+}
+
+/// Get interface info using Linux `ip` command.
+#[cfg(target_os = "linux")]
+fn get_interface_info_linux(interface: &str) -> Option<(String, String)> {
+    let mut ip_addr = String::new();
+    let mut mtu = String::new();
+
+    // Get IP address using `ip addr show <interface>`
+    if let Ok(output) = Command::new("ip")
+        .args(["addr", "show", interface])
+        .output()
+    {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for line in stdout.lines() {
+            let line = line.trim();
+            // Look for inet line: "inet 10.8.0.2/24 scope global tun0"
+            if line.starts_with("inet ") {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 2 {
+                    // Extract IP without CIDR notation
+                    if let Some(addr) = parts[1].split('/').next() {
+                        ip_addr = addr.to_string();
+                    }
+                }
+            }
+            // Look for mtu in the first line: "4: tun0: <POINTOPOINT,NOARP,UP,LOWER_UP> mtu 1500"
+            if line.contains("mtu ") {
+                if let Some(mtu_part) = line.split("mtu ").nth(1) {
+                    if let Some(mtu_val) = mtu_part.split_whitespace().next() {
+                        mtu = mtu_val.to_string();
+                    }
+                }
+            }
+        }
+    }
+
+    if !ip_addr.is_empty() || !mtu.is_empty() {
+        Some((ip_addr, mtu))
+    } else {
+        None
+    }
+}
+
+/// Get interface info using macOS `ifconfig` command.
+#[cfg(target_os = "macos")]
+fn get_interface_info_macos(interface: &str) -> Option<(String, String)> {
+    let mut ip_addr = String::new();
+    let mut mtu = String::new();
+
+    if let Ok(output) = Command::new("ifconfig").arg(interface).output() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for line in stdout.lines() {
+            let line = line.trim();
+            if line.starts_with("inet ") {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 2 {
+                    ip_addr = parts[1].to_string();
+                }
+            }
+            if let Some(v) = line.split("mtu ").nth(1) {
+                mtu = v.split_whitespace().next().unwrap_or("").to_string();
+            }
+        }
+    }
+
+    if !ip_addr.is_empty() || !mtu.is_empty() {
+        Some((ip_addr, mtu))
+    } else {
+        None
+    }
+}
+
+/// Scan all interfaces for OpenVPN connections using cross-platform commands.
+///
+/// Uses `ip link` on Linux and `ifconfig` on macOS.
+fn scan_all_interfaces_for_openvpn(detected_iface: &str) -> Option<(String, String, String)> {
+    #[cfg(target_os = "linux")]
+    {
+        scan_interfaces_linux(detected_iface)
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        scan_interfaces_macos(detected_iface)
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        None
+    }
+}
+
+/// Scan interfaces on Linux using `ip` command.
+#[cfg(target_os = "linux")]
+fn scan_interfaces_linux(detected_iface: &str) -> Option<(String, String, String)> {
+    // Get list of interfaces
+    let output = Command::new("ip").args(["link", "show"]).output().ok()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    for line in stdout.lines() {
+        // Interface line format: "4: tun0: <POINTOPOINT,NOARP,UP,LOWER_UP> mtu 1500"
+        if !line.starts_with(' ') && line.contains(':') {
+            let parts: Vec<&str> = line.split(':').collect();
+            if parts.len() >= 2 {
+                let iface_name = parts[1].trim();
+
+                // Check if this is a VPN interface
+                let is_target = if detected_iface.is_empty() {
+                    iface_name.starts_with("tun") || iface_name.starts_with("tap")
+                } else {
+                    iface_name == detected_iface
+                };
+
+                if is_target {
+                    // Verify not a WireGuard interface
+                    let wg_check = Command::new("wg")
+                        .args(["show", iface_name])
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .status();
+
+                    if matches!(wg_check, Ok(s) if !s.success()) {
+                        // Get IP and MTU for this interface
+                        if let Some((ip, mtu)) = get_interface_info_linux(iface_name) {
+                            return Some((iface_name.to_string(), ip, mtu));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Scan interfaces on macOS using `ifconfig` command.
+#[cfg(target_os = "macos")]
+fn scan_interfaces_macos(detected_iface: &str) -> Option<(String, String, String)> {
+    let output = Command::new("ifconfig").output().ok()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut current_iface = String::new();
+    let mut found_openvpn_iface = false;
+    let mut iface_mtu = String::new();
+
+    for line in stdout.lines() {
+        // Interface line starts with the interface name (no leading whitespace)
+        if !line.starts_with(' ') && !line.starts_with('\t') {
+            // New interface block
+            if let Some(iface_name) = line.split(':').next() {
+                current_iface = iface_name.to_string();
+
+                // If we found the interface via lsof, we strictly look for that
+                if detected_iface.is_empty() {
+                    // OpenVPN typically uses utun (macOS) or tun (Linux)
+                    found_openvpn_iface = current_iface.starts_with("utun")
+                        || current_iface.starts_with("tun")
+                        || current_iface.starts_with("tap");
+                } else {
+                    found_openvpn_iface = current_iface == detected_iface;
+                }
+
+                // Extract MTU from flags line
+                if found_openvpn_iface {
+                    if let Some(mtu_idx) = line.find("mtu ") {
+                        iface_mtu = line[mtu_idx + 4..]
+                            .split_whitespace()
+                            .next()
+                            .unwrap_or("")
+                            .to_string();
+                    }
+                }
+            }
+        } else if found_openvpn_iface {
+            let line = line.trim();
+            // Look for inet address
+            if line.starts_with("inet ") {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 2 {
+                    // Verify this isn't a WireGuard interface
+                    let wg_check = Command::new("wg")
+                        .args(["show", &current_iface])
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .status();
+
+                    if matches!(wg_check, Ok(s) if !s.success()) {
+                        return Some((
+                            current_iface.clone(),
+                            parts[1].to_string(),
+                            iface_mtu.clone(),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    None
 }

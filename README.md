@@ -32,12 +32,22 @@ Existing options (`wg show`, NetworkManager, Tunnelblick) either lack real-time 
 
 ## Requirements
 
-- macOS (uses `ifconfig`, `netstat`, `wg`, `ps` commands)
+### macOS
 - Rust 1.75+ (for building from source)
 - WireGuard: `brew install wireguard-tools`
 - OpenVPN: `brew install openvpn`
 
-Linux support is planned but not yet implemented.
+### Linux
+- Rust 1.75+ (for building from source)
+- WireGuard: Install via your package manager
+  - Debian/Ubuntu: `sudo apt install wireguard-tools`
+  - Fedora/RHEL: `sudo dnf install wireguard-tools`
+  - Arch: `sudo pacman -S wireguard-tools`
+- OpenVPN: Install via your package manager
+  - Debian/Ubuntu: `sudo apt install openvpn`
+  - Fedora/RHEL: `sudo dnf install openvpn`
+  - Arch: `sudo pacman -S openvpn`
+- iptables (usually pre-installed)
 
 ## Installation
 
@@ -81,7 +91,15 @@ Profiles are stored in `~/.config/vortix/profiles/` with `chmod 600`.
 
 ## How It Works
 
-**Telemetry:** A background thread polls `netstat -ib` every second for throughput. Network quality (latency, jitter, loss) is calculated using multi-packet ICMP probes. Public IP, ISP, and Geo-location data are fetched via `ipinfo.io/json`.
+**Telemetry:** A background thread monitors network statistics (using `netstat -ib` on macOS or `/proc/net/dev` on Linux) every second for throughput. Network quality (latency, jitter, loss) is calculated using multi-packet ICMP probes. Public IP, ISP, and Geo-location data are fetched via `ipinfo.io/json`.
+
+**Kill Switch:** Uses platform-native firewall management:
+- macOS: Configures `pf` (Packet Filter) rules
+- Linux: Configures `iptables` rules
+
+**Interface Detection:** Uses platform-appropriate commands:
+- macOS: `ifconfig` for interface information
+- Linux: `ip` command for interface information
 
 **Security (Kill Switch & Leak Detection):**
 - **Kill Switch:** Advanced PF (Packet Filter) firewall integration on macOS. Automatically blocks all non-VPN traffic when connection drops.

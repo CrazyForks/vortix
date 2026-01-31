@@ -522,7 +522,7 @@ fn get_interface_info_macos(interface: &str) -> Option<(String, String)> {
     }
 }
 
-/// Scan all interfaces for OpenVPN connections using cross-platform commands.
+/// Scan all interfaces for `OpenVPN` connections using cross-platform commands.
 ///
 /// Uses `ip link` on Linux and `ifconfig` on macOS.
 fn scan_all_interfaces_for_openvpn(detected_iface: &str) -> Option<(String, String, String)> {

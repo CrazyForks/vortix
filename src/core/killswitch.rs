@@ -285,6 +285,7 @@ fn disable_blocking_pf() -> Result<()> {
 
 /// Enable kill switch using Linux iptables.
 #[cfg(target_os = "linux")]
+#[allow(clippy::too_many_lines)]
 fn enable_blocking_iptables(vpn_interface: &str, vpn_server_ip: Option<&str>) -> Result<()> {
     // First, clean up any existing rules
     let _ = disable_blocking_iptables();
@@ -423,6 +424,7 @@ fn enable_blocking_iptables(vpn_interface: &str, vpn_server_ip: Option<&str>) ->
 
 /// Disable kill switch using Linux iptables.
 #[cfg(target_os = "linux")]
+#[allow(clippy::unnecessary_wraps)]
 fn disable_blocking_iptables() -> Result<()> {
     // Remove references to our chain from INPUT and OUTPUT
     let _ = Command::new("iptables")

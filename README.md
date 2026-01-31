@@ -102,7 +102,9 @@ Profiles are stored in `~/.config/vortix/profiles/` with `chmod 600`.
 - Linux: `ip` command for interface information
 
 **Security (Kill Switch & Leak Detection):**
-- **Kill Switch:** Advanced PF (Packet Filter) firewall integration on macOS. Automatically blocks all non-VPN traffic when connection drops.
+- **Kill Switch:** Advanced firewall integration that automatically blocks all non-VPN traffic when connection drops.
+  - macOS: Uses `pf` (Packet Filter)
+  - Linux: Uses `iptables` with custom rules
 - **IPv6 Leak:** Active monitoring via `api6.ipify.org`. Any IPv6 traffic detected while VPN is active triggers a leak warning.
 - **DNS Leak:** Monitors `/etc/resolv.conf` to ensure nameservers and search domains align with the secure tunnel.
 

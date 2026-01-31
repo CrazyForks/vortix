@@ -243,6 +243,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::case_sensitive_file_extension_comparisons)]
     fn test_extract_filename_no_extension() {
         // Should default to .conf
         let result = extract_filename_from_url("https://example.com/api/getconfig");
@@ -250,6 +251,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::case_sensitive_file_extension_comparisons)]
     fn test_extract_filename_ovpn_in_url() {
         // Should use .ovpn if mentioned in URL
         let result = extract_filename_from_url("https://example.com/openvpn/download");

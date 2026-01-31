@@ -238,7 +238,7 @@ mod tests {
         clear_logs();
 
         for i in 0..1500 {
-            log(LogLevel::Info, "TEST", format!("Message {}", i));
+            log(LogLevel::Info, "TEST", format!("Message {i}"));
         }
 
         let logs = get_logs();

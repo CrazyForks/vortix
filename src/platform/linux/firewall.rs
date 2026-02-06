@@ -120,15 +120,13 @@ impl IptablesFirewall {
     }
 
     /// Remove the kill switch chain from iptables.
-    fn teardown_iptables() -> Result<()> {
+    fn teardown_iptables() {
         // Remove jump from OUTPUT chain (ignore error if not present)
         let _ = Self::iptables(&["-D", "OUTPUT", "-j", CHAIN_NAME]);
 
         // Flush and delete our custom chain
         let _ = Self::iptables(&["-F", CHAIN_NAME]);
         let _ = Self::iptables(&["-X", CHAIN_NAME]);
-
-        Ok(())
     }
 
     // ─── nftables backend ───────────────────────────────────────────────
@@ -149,10 +147,12 @@ impl IptablesFirewall {
 
     /// Set up the kill switch with nftables using an atomic ruleset load.
     fn setup_nftables(vpn_interface: &str, vpn_server_ip: Option<&str>) -> Result<()> {
+        use std::fmt::Write;
+
         // Build an atomic nft ruleset — applied in one shot so there's no
         // window where traffic could leak between rule additions.
         let mut ruleset = format!(
-            r#"table inet {table} {{
+            r#"table inet {NFT_TABLE} {{
   chain output {{
     type filter hook output priority 0; policy drop;
 
@@ -160,7 +160,7 @@ impl IptablesFirewall {
     oifname "lo" accept
 
     # Allow VPN interface
-    oifname "{vpn}" accept
+    oifname "{vpn_interface}" accept
 
     # Allow local networks (RFC1918)
     ip daddr 192.168.0.0/16 accept
@@ -170,14 +170,13 @@ impl IptablesFirewall {
     # Allow DHCP
     udp sport 68 udp dport 67 accept
 "#,
-            table = NFT_TABLE,
-            vpn = vpn_interface,
         );
 
         if let Some(ip) = vpn_server_ip {
-            ruleset.push_str(&format!(
+            let _ = write!(
+                ruleset,
                 "\n    # Allow VPN server for reconnection\n    ip daddr {ip} accept\n"
-            ));
+            );
         }
 
         ruleset.push_str("  }\n}\n");
@@ -214,10 +213,9 @@ impl IptablesFirewall {
     }
 
     /// Remove the kill switch nftables table.
-    fn teardown_nftables() -> Result<()> {
+    fn teardown_nftables() {
         // Deleting the table removes all chains and rules inside it
         let _ = Self::nft(&["delete", "table", "inet", NFT_TABLE]);
-        Ok(())
     }
 }
 
@@ -281,8 +279,8 @@ impl Firewall for IptablesFirewall {
         }
 
         // Clean up both backends — safe to call on each even if not active
-        Self::teardown_iptables()?;
-        Self::teardown_nftables()?;
+        Self::teardown_iptables();
+        Self::teardown_nftables();
 
         logger::log(
             LogLevel::Info,

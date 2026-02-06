@@ -5,9 +5,9 @@ use crate::platform::DnsResolver;
 use std::process::Command;
 
 /// Linux DNS resolution with fallback chain:
-/// 1. resolvectl (systemd-resolved)
-/// 2. nmcli (NetworkManager)
-/// 3. /etc/resolv.conf (universal fallback)
+/// 1. `resolvectl` (systemd-resolved)
+/// 2. `nmcli` (`NetworkManager`)
+/// 3. `/etc/resolv.conf` (universal fallback)
 pub struct LinuxDns;
 
 impl DnsResolver for LinuxDns {
@@ -44,7 +44,7 @@ fn try_get_dns_resolvectl() -> Option<String> {
     None
 }
 
-/// Try to get DNS from nmcli (NetworkManager distros).
+/// Try to get DNS from `nmcli` (`NetworkManager` distros).
 fn try_get_dns_nmcli() -> Option<String> {
     let output = Command::new("nmcli").args(["dev", "show"]).output().ok()?;
 
@@ -85,8 +85,6 @@ fn try_get_dns_resolv_conf() -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn test_parse_resolv_conf() {
         // Simulate the parsing logic

@@ -1033,12 +1033,28 @@ impl App {
         // 7. Update network stats history (O(1) ring-buffer rotation)
         self.engine.down_history.pop_front();
         self.engine.up_history.pop_front();
+        self.engine.latency_history.pop_front();
         #[allow(clippy::cast_precision_loss)]
         {
             let down = self.engine.current_down;
             let up = self.engine.current_up;
             self.engine.down_history.push_back(down as f64);
             self.engine.up_history.push_back(up as f64);
+        }
+        self.engine
+            .latency_history
+            .push_back(self.engine.latency_ms);
+
+        // 8. Accumulate session transfer totals and track peaks
+        if matches!(self.connection_state, ConnectionState::Connected { .. }) {
+            self.engine.session_total_down += self.engine.current_down;
+            self.engine.session_total_up += self.engine.current_up;
+            if self.engine.current_down > self.engine.session_peak_down {
+                self.engine.session_peak_down = self.engine.current_down;
+            }
+            if self.engine.current_up > self.engine.session_peak_up {
+                self.engine.session_peak_up = self.engine.current_up;
+            }
         }
     }
 

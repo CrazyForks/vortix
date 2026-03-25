@@ -318,66 +318,126 @@ fn render_back(frame: &mut Frame, app: &App, area: Rect, border_style: Style) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let is_connected = !matches!(app.connection_state, ConnectionState::Disconnected);
+    let lines = match &app.connection_state {
+        ConnectionState::Connected { details, .. } => {
+            let check_pass = |label: &str| -> Vec<Span<'_>> {
+                vec![
+                    Span::styled("✓ ", Style::default().fg(theme::SUCCESS)),
+                    Span::styled(label.to_string(), Style::default().fg(theme::NORD_GREEN)),
+                ]
+            };
+            let check_fail = |label: &str| -> Vec<Span<'_>> {
+                vec![
+                    Span::styled("✗ ", Style::default().fg(theme::ERROR)),
+                    Span::styled(label.to_string(), Style::default().fg(theme::NORD_RED)),
+                ]
+            };
 
-    let text = if is_connected {
-        vec![
-            Line::from(Span::styled(
-                "Active Connections Audit",
-                Style::default()
-                    .fg(theme::ACCENT_PRIMARY)
-                    .add_modifier(Modifier::BOLD),
-            )),
-            Line::from(""),
-            Line::from(Span::styled(
-                "  Per-socket VPN routing verification",
-                Style::default().fg(theme::TEXT_SECONDARY),
-            )),
-            Line::from(Span::styled(
-                "  will be available in a future release.",
-                Style::default().fg(theme::TEXT_SECONDARY),
-            )),
-            Line::from(""),
-            Line::from(Span::styled(
-                "  This view will show which connections",
-                Style::default().fg(theme::TEXT_SECONDARY),
-            )),
-            Line::from(Span::styled(
-                "  are routed through the VPN tunnel vs",
-                Style::default().fg(theme::TEXT_SECONDARY),
-            )),
-            Line::from(Span::styled(
-                "  bypassing it (split-tunnel detection).",
-                Style::default().fg(theme::TEXT_SECONDARY),
-            )),
-            Line::from(""),
-            Line::from(Span::styled(
-                "  See: github.com/Harry-kp/vortix/issues/168",
-                Style::default().fg(theme::NORD_POLAR_NIGHT_4),
-            )),
-        ]
-    } else {
-        vec![
-            Line::from(Span::styled(
-                "Active Connections Audit",
-                Style::default()
-                    .fg(theme::INACTIVE)
-                    .add_modifier(Modifier::BOLD),
-            )),
-            Line::from(""),
-            Line::from(Span::styled(
-                "  Connect to a VPN to see",
-                Style::default().fg(theme::TEXT_SECONDARY),
-            )),
-            Line::from(Span::styled(
-                "  connection routing details.",
-                Style::default().fg(theme::TEXT_SECONDARY),
-            )),
-        ]
+            let iface = &details.interface;
+            let endpoint = &details.endpoint;
+            let internal_ip = &details.internal_ip;
+
+            let routing_line = if !iface.is_empty() {
+                Line::from(check_pass(&format!("Traffic routed via {iface}")))
+            } else {
+                Line::from(check_fail("Direct connection"))
+            };
+
+            let dns_line =
+                if !app.dns_server.is_empty() && app.dns_server != constants::MSG_DETECTING {
+                    let dns_ok = match &app.real_dns {
+                        Some(real) => &app.dns_server != real,
+                        None => true,
+                    };
+                    if dns_ok {
+                        Line::from(check_pass(&format!("DNS: {}", app.dns_server)))
+                    } else {
+                        Line::from(check_fail("DNS leak detected"))
+                    }
+                } else {
+                    Line::from(vec![
+                        Span::styled("● ", Style::default().fg(theme::WARNING)),
+                        Span::styled("DNS: detecting...", Style::default().fg(theme::NORD_YELLOW)),
+                    ])
+                };
+
+            let ipv6_line = if app.ipv6_leak {
+                Line::from(check_fail("IPv6 leak detected"))
+            } else {
+                Line::from(check_pass("IPv6: Blocked"))
+            };
+
+            let max_val = inner.width.saturating_sub(16) as usize;
+            let truncate = |s: &str| -> String {
+                if s.len() > max_val {
+                    format!("{}…", &s[..max_val.saturating_sub(1)])
+                } else {
+                    s.to_string()
+                }
+            };
+
+            vec![
+                Line::from(Span::styled(
+                    "Connections Audit",
+                    Style::default()
+                        .fg(theme::ACCENT_PRIMARY)
+                        .add_modifier(Modifier::BOLD),
+                )),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled(" Interface : ", Style::default().fg(theme::TEXT_SECONDARY)),
+                    Span::styled(truncate(iface), Style::default().fg(theme::TEXT_PRIMARY)),
+                ]),
+                Line::from(vec![
+                    Span::styled(" Endpoint  : ", Style::default().fg(theme::TEXT_SECONDARY)),
+                    Span::styled(truncate(endpoint), Style::default().fg(theme::TEXT_PRIMARY)),
+                ]),
+                Line::from(vec![
+                    Span::styled(" Internal  : ", Style::default().fg(theme::TEXT_SECONDARY)),
+                    Span::styled(
+                        truncate(internal_ip),
+                        Style::default().fg(theme::TEXT_PRIMARY),
+                    ),
+                ]),
+                Line::from(vec![
+                    Span::styled(" Public IP : ", Style::default().fg(theme::TEXT_SECONDARY)),
+                    Span::styled(
+                        truncate(&app.public_ip),
+                        Style::default().fg(theme::TEXT_PRIMARY),
+                    ),
+                ]),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Security Posture",
+                    Style::default()
+                        .fg(theme::ACCENT_PRIMARY)
+                        .add_modifier(Modifier::BOLD),
+                )),
+                Line::from(""),
+                routing_line,
+                dns_line,
+                ipv6_line,
+            ]
+        }
+        _ => {
+            vec![
+                Line::from(Span::styled(
+                    "Connections Audit",
+                    Style::default()
+                        .fg(theme::INACTIVE)
+                        .add_modifier(Modifier::BOLD),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Connect to a VPN to see connections audit.",
+                    Style::default().fg(theme::TEXT_SECONDARY),
+                )),
+            ]
+        }
     };
 
     let max_lines = inner.height as usize;
-    let mut text = text;
-    text.truncate(max_lines);
-    frame.render_widget(Paragraph::new(text), inner);
+    let mut lines = lines;
+    lines.truncate(max_lines);
+    frame.render_widget(Paragraph::new(lines), inner);
 }

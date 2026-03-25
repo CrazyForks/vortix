@@ -529,6 +529,10 @@ impl App {
         self.ip_unchanged_warned = false;
         self.current_down = 0;
         self.current_up = 0;
+        self.session_total_down = 0;
+        self.session_total_up = 0;
+        self.session_peak_down = 0;
+        self.session_peak_up = 0;
 
         // Clean up OpenVPN runtime files if this was an OpenVPN profile
         if self

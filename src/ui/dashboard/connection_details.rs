@@ -341,6 +341,72 @@ fn render_back(frame: &mut Frame, app: &App, area: Rect, border_style: Style) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
+    if !matches!(app.connection_state, ConnectionState::Connected { .. }) {
+        let text = vec![Line::from(Span::styled(
+            "Connect to a VPN to see quality metrics.",
+            Style::default().fg(theme::INACTIVE),
+        ))];
+        frame.render_widget(Paragraph::new(text), inner);
+        return;
+    }
+
+    let bars = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+
+    let sparkline_spans: Vec<Span> = if app.latency_history.is_empty() {
+        vec![Span::styled(
+            "No data yet",
+            Style::default().fg(theme::TEXT_SECONDARY),
+        )]
+    } else {
+        let max_val = app
+            .latency_history
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(1)
+            .max(1);
+        app.latency_history
+            .iter()
+            .map(|&v| {
+                let level = ((v as usize) * 7 / (max_val as usize)).min(7);
+                let color = if v < 50 {
+                    theme::NORD_GREEN
+                } else if v <= 150 {
+                    theme::NORD_YELLOW
+                } else {
+                    theme::NORD_RED
+                };
+                Span::styled(bars[level].to_string(), Style::default().fg(color))
+            })
+            .collect()
+    };
+
+    let non_zero: Vec<u64> = app
+        .latency_history
+        .iter()
+        .copied()
+        .filter(|&v| v > 0)
+        .collect();
+    let (min_lat, avg_lat, max_lat) = if non_zero.is_empty() {
+        (0u64, 0u64, 0u64)
+    } else {
+        let min = non_zero.iter().copied().min().unwrap_or(0);
+        let max = non_zero.iter().copied().max().unwrap_or(0);
+        let avg = non_zero.iter().copied().sum::<u64>() / non_zero.len() as u64;
+        (min, avg, max)
+    };
+
+    let duration_str = match app.session_start {
+        Some(start) => {
+            let secs = start.elapsed().as_secs();
+            let h = secs / 3600;
+            let m = (secs % 3600) / 60;
+            let s = secs % 60;
+            format!("{h}h {m}m {s}s")
+        }
+        None => "—".to_string(),
+    };
+
     let latency_color = if app.latency_ms < 50 {
         theme::NORD_GREEN
     } else if app.latency_ms < 150 {
@@ -349,13 +415,14 @@ fn render_back(frame: &mut Frame, app: &App, area: Rect, border_style: Style) {
         theme::NORD_RED
     };
 
-    let text = vec![
+    let mut text = vec![
         Line::from(Span::styled(
-            "Session Quality History",
+            "Quality Timeline",
             Style::default()
                 .fg(theme::ACCENT_PRIMARY)
                 .add_modifier(Modifier::BOLD),
         )),
+        Line::from(sparkline_spans),
         Line::from(""),
         Line::from(vec![
             Span::styled("  Latency : ", Style::default().fg(theme::TEXT_SECONDARY)),
@@ -379,23 +446,29 @@ fn render_back(frame: &mut Frame, app: &App, area: Rect, border_style: Style) {
             ),
         ]),
         Line::from(""),
-        Line::from(Span::styled(
-            "  Sparkline history & session stats",
-            Style::default().fg(theme::TEXT_SECONDARY),
-        )),
-        Line::from(Span::styled(
-            "  will be available in a future release.",
-            Style::default().fg(theme::TEXT_SECONDARY),
-        )),
-        Line::from(""),
-        Line::from(Span::styled(
-            "  See: github.com/Harry-kp/vortix/issues/167",
-            Style::default().fg(theme::NORD_POLAR_NIGHT_4),
-        )),
+        Line::from(vec![
+            Span::styled(
+                "  Min/Avg/Max: ",
+                Style::default().fg(theme::TEXT_SECONDARY),
+            ),
+            Span::styled(
+                format!("{min_lat}/{avg_lat}/{max_lat} ms"),
+                Style::default().fg(theme::TEXT_PRIMARY),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("  Drops     : ", Style::default().fg(theme::TEXT_SECONDARY)),
+            Span::styled(
+                format!("{}", app.connection_drops),
+                Style::default().fg(theme::TEXT_PRIMARY),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("  Duration  : ", Style::default().fg(theme::TEXT_SECONDARY)),
+            Span::styled(duration_str, Style::default().fg(theme::TEXT_PRIMARY)),
+        ]),
     ];
 
-    let max_lines = inner.height as usize;
-    let mut text = text;
-    text.truncate(max_lines);
+    text.truncate(inner.height as usize);
     frame.render_widget(Paragraph::new(text), inner);
 }

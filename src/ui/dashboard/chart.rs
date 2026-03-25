@@ -2,7 +2,7 @@ use crate::app::{App, ConnectionState};
 use crate::{constants, theme, utils};
 use ratatui::{
     layout::{Alignment, Constraint, Layout, Rect},
-    style::Style,
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{
         canvas::{Canvas, Line as CanvasLine},
@@ -148,6 +148,20 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(canvas, chunks[1]);
 }
 
+fn format_bytes(bytes: u64) -> String {
+    #[allow(clippy::cast_precision_loss)]
+    let b = bytes as f64;
+    if b >= 1_000_000_000.0 {
+        format!("{:.1} GB", b / 1_000_000_000.0)
+    } else if b >= 1_000_000.0 {
+        format!("{:.1} MB", b / 1_000_000.0)
+    } else if b >= 1_000.0 {
+        format!("{:.1} KB", b / 1_000.0)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
 fn render_back(frame: &mut Frame, app: &App, area: Rect, border_style: Style) {
     let block = Block::default()
         .borders(Borders::ALL)
@@ -164,39 +178,78 @@ fn render_back(frame: &mut Frame, app: &App, area: Rect, border_style: Style) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let current_down_str = utils::format_bytes_speed(app.current_down);
-    let current_up_str = utils::format_bytes_speed(app.current_up);
+    let is_connected = matches!(app.connection_state, ConnectionState::Connected { .. });
 
-    let text = vec![
-        Line::from(""),
-        Line::from(Span::styled(
-            "Per-Process Network Usage",
-            Style::default()
-                .fg(theme::ACCENT_PRIMARY)
-                .add_modifier(ratatui::style::Modifier::BOLD),
-        )),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled("  Total ▼ ", Style::default().fg(theme::NORD_FROST_2)),
-            Span::styled(&current_down_str, Style::default().fg(theme::TEXT_PRIMARY)),
-            Span::styled("  ▲ ", Style::default().fg(theme::NORD_GREEN)),
-            Span::styled(&current_up_str, Style::default().fg(theme::TEXT_PRIMARY)),
-        ]),
-        Line::from(""),
-        Line::from(Span::styled(
-            "  Process table with sorting & filtering",
-            Style::default().fg(theme::TEXT_SECONDARY),
-        )),
-        Line::from(Span::styled(
-            "  will be available in a future release.",
-            Style::default().fg(theme::TEXT_SECONDARY),
-        )),
-        Line::from(""),
-        Line::from(Span::styled(
-            "  See: github.com/Harry-kp/vortix/issues/166",
-            Style::default().fg(theme::NORD_POLAR_NIGHT_4),
-        )),
-    ];
+    let text = if is_connected {
+        let label_style = Style::default().fg(theme::TEXT_SECONDARY);
+        let down_icon = Style::default().fg(theme::NORD_FROST_2);
+        let up_icon = Style::default().fg(theme::NORD_GREEN);
+        let val_style = Style::default().fg(theme::TEXT_PRIMARY);
+
+        let duration_line = if let Some(start) = app.session_start {
+            let elapsed = start.elapsed().as_secs();
+            let h = elapsed / 3600;
+            let m = (elapsed % 3600) / 60;
+            let s = elapsed % 60;
+            Line::from(vec![
+                Span::styled("  Duration   ", label_style),
+                Span::styled(format!("{h}h {m}m {s}s"), val_style),
+            ])
+        } else {
+            Line::from(vec![
+                Span::styled("  Duration   ", label_style),
+                Span::styled("–", val_style),
+            ])
+        };
+
+        vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "Session Network Stats",
+                Style::default()
+                    .fg(theme::ACCENT_PRIMARY)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("  ▼ Download  ", down_icon),
+                Span::styled(utils::format_bytes_speed(app.current_down), val_style),
+            ]),
+            Line::from(vec![
+                Span::styled("  ▲ Upload    ", up_icon),
+                Span::styled(utils::format_bytes_speed(app.current_up), val_style),
+            ]),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("  ▼ Peak Down ", down_icon),
+                Span::styled(utils::format_bytes_speed(app.session_peak_down), val_style),
+            ]),
+            Line::from(vec![
+                Span::styled("  ▲ Peak Up   ", up_icon),
+                Span::styled(utils::format_bytes_speed(app.session_peak_up), val_style),
+            ]),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("  ▼ Total Down ", down_icon),
+                Span::styled(format_bytes(app.session_total_down), val_style),
+            ]),
+            Line::from(vec![
+                Span::styled("  ▲ Total Up   ", up_icon),
+                Span::styled(format_bytes(app.session_total_up), val_style),
+            ]),
+            Line::from(""),
+            duration_line,
+        ]
+    } else {
+        vec![
+            Line::from(""),
+            Line::from(""),
+            Line::from(Span::styled(
+                "  Connect to a VPN to see network activity.",
+                Style::default().fg(theme::INACTIVE),
+            )),
+        ]
+    };
 
     frame.render_widget(Paragraph::new(text).alignment(Alignment::Left), inner);
 }

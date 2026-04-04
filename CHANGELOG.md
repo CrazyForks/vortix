@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-04-04
+
+### Fixed
+
+- Detect missing `resolvconf` before WireGuard connect on Linux, with automatic distro-specific install hints (systemd-resolvconf vs openresolv). Previously, users on Arch/Fedora would see cryptic wg-quick errors when DNS was configured but the tool wasn't installed ([#186](https://github.com/Harry-kp/vortix/pull/186)).
+- Add dependency check to CLI `vortix up` command, matching the TUI's pre-flight validation to catch missing tools before attempting connection ([#186](https://github.com/Harry-kp/vortix/pull/186)).
+- Fix systemd-resolvconf compatibility by testing `resolvconf --version` instead of `resolvconf -l`, since systemd-resolvconf's shim doesn't support the `-l` flag.
+- Suppress unused variable warning on macOS by moving `config_path` declaration inside the Linux-specific cfg block.
+
+### Documentation
+
+- Add comprehensive Arch Linux & distribution-specific FAQ with troubleshooting for missing resolvconf, iptables kernel modules, and non-systemd distros ([#186](https://github.com/Harry-kp/vortix/pull/186)).
+- Clarify iptables kernel module unavailability on cloud providers (DigitalOcean, AWS Lambda, etc.) and provide workaround guidance with WireGuard `AllowedIPs` configuration examples.
+- Expand troubleshooting section with quick error reference table, WireGuard configuration best practices, and cloud provider routing guidance.
+- Enhance Requirements section with explicit DNS tool installation per distro and when tools are needed.
+
 ## [0.2.0] - 2026-03-31
 
 ### Added

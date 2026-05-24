@@ -6,11 +6,11 @@
 
 use std::path::{Path, PathBuf};
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{UnixListener, UnixStream};
-use vortix_core::ipc::{
+use crate::vortix_core::ipc::{
     decode_frame, encode_frame, FrameError, IpcError, IpcOp, IpcRequest, IpcResponse, IpcResult,
 };
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{UnixListener, UnixStream};
 
 /// The daemon server. Holds the socket binding + the engine handle.
 pub struct DaemonServer {
@@ -133,10 +133,6 @@ async fn dispatch(req: IpcRequest) -> IpcResponse {
             "engine wiring not yet connected in daemon — coming in v0.3.x".into(),
         )),
         IpcOp::Shutdown => Ok(IpcResult::ShuttingDown),
-        // IpcOp is #[non_exhaustive]; future variants surface as
-        // MalformedRequest at the wire level until the daemon learns
-        // about them.
-        _ => Err(IpcError::MalformedRequest("unknown op variant".into())),
     };
     IpcResponse { id: req.id, result }
 }

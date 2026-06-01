@@ -44,7 +44,7 @@ fn test_app() -> App {
 
 fn add_wg_profiles(app: &mut App, names: &[&str]) {
     for name in names {
-        app.engine.profiles.push(VpnProfile {
+        app.runtime.profiles.push(VpnProfile {
             name: (*name).to_string(),
             protocol: Protocol::WireGuard,
             config_path: std::path::PathBuf::from(format!("/tmp/{name}.conf")),
@@ -55,38 +55,38 @@ fn add_wg_profiles(app: &mut App, names: &[&str]) {
 }
 
 fn set_connected(app: &mut App, name: &str) {
-    app.engine.session_start = Some(Instant::now());
-    app.engine.connection_state = ConnectionState::Connected {
-        since: Instant::now(),
-        profile: name.to_string(),
-        server_location: "Test".to_string(),
-        latency_ms: 10,
-        details: Box::new(DetailedConnectionInfo {
-            interface: "wg0".to_string(),
-            pid: Some(12345),
-            ..Default::default()
-        }),
+    if !app.runtime.profiles.iter().any(|p| p.name == name) {
+        add_wg_profiles(app, &[name]);
+    }
+    app.runtime.session_start = Some(Instant::now());
+    let details = DetailedConnectionInfo {
+        interface: "wg0".to_string(),
+        pid: Some(12345),
+        ..Default::default()
     };
+    app.mirror_connect_into_registry(name, &details, Instant::now());
 }
 
 fn set_connecting(app: &mut App, name: &str) {
-    app.engine.connection_state = ConnectionState::Connecting {
-        started: Instant::now(),
-        profile: name.to_string(),
-    };
+    if !app.runtime.profiles.iter().any(|p| p.name == name) {
+        add_wg_profiles(app, &[name]);
+    }
+    app.mirror_connecting_into_registry(name);
 }
 
 fn set_disconnecting(app: &mut App, name: &str) {
-    app.engine.connection_state = ConnectionState::Disconnecting {
-        started: Instant::now(),
-        profile: name.to_string(),
-    };
+    use vortix::vortix_core::profile::ProfileId;
+    if app.registry.snapshot(&ProfileId::new(name)).is_none() {
+        set_connected(app, name);
+    }
+    app.mirror_disconnecting_into_registry(name);
 }
 
 fn fake_session(name: &str) -> ActiveSession {
     ActiveSession {
         name: name.to_string(),
         interface: "wg0".to_string(),
+        interface_authoritative: true,
         endpoint: "1.2.3.4:51820".to_string(),
         internal_ip: "10.0.0.2".to_string(),
         mtu: "1420".to_string(),
@@ -115,10 +115,7 @@ mod connection_state_machine {
         // Simulate connect_profile setting state (avoids spawning real wg-quick)
         set_connecting(&mut app, "vpn-a");
         assert!(
-            matches!(
-                app.engine.connection_state,
-                ConnectionState::Connecting { .. }
-            ),
+            matches!(app.legacy_state(), ConnectionState::Connecting { .. }),
             "Disconnected -> Connecting on connect"
         );
     }
@@ -133,9 +130,11 @@ mod connection_state_machine {
             profile: "vpn-a".to_string(),
             success: true,
             error: None,
+            interface: None,
+            pid: None,
         });
         assert!(matches!(
-            app.engine.connection_state,
+            app.legacy_state(),
             ConnectionState::Connected { .. }
         ));
     }
@@ -149,24 +148,33 @@ mod connection_state_machine {
             profile: "vpn-a".to_string(),
             success: false,
             error: Some("refused".to_string()),
+            interface: None,
+            pid: None,
         });
-        assert!(matches!(
-            app.engine.connection_state,
-            ConnectionState::Disconnected
-        ));
+        assert!(matches!(app.legacy_state(), ConnectionState::Disconnected));
     }
 
     #[test]
-    fn connecting_to_connected_via_scanner() {
+    fn scanner_does_not_promote_connecting_to_connected() {
+        // U4 contract: scanner cannot drive Connecting → Connected.
+        // Only the protocol layer's `Tunnel::up()` success result
+        // (delivered via `Message::ConnectResult`) can promote.
+        //
+        // Pre-U4 this test asserted the opposite (and was named
+        // `connecting_to_connected_via_scanner`). The dual write was
+        // the source of bugs #3 and #12 in the multi-OpenVPN scenarios.
         let mut app = test_app();
         add_wg_profiles(&mut app, &["vpn-a"]);
         set_connecting(&mut app, "vpn-a");
 
-        app.handle_message(Message::SyncSystemState(vec![fake_session("vpn-a")]));
-        assert!(matches!(
-            app.engine.connection_state,
-            ConnectionState::Connected { .. }
-        ));
+        app.handle_message(Message::SyncSystemState {
+            sessions: vec![fake_session("vpn-a")],
+            default_route_interface: None,
+        });
+        assert!(
+            matches!(app.legacy_state(), ConnectionState::Connecting { .. }),
+            "scanner-visible session for a Connecting tunnel must NOT promote — only ConnectResult can"
+        );
     }
 
     #[test]
@@ -174,12 +182,12 @@ mod connection_state_machine {
         let mut app = test_app();
         set_connecting(&mut app, "vpn-a");
 
-        app.handle_message(Message::SyncSystemState(vec![]));
+        app.handle_message(Message::SyncSystemState {
+            sessions: vec![],
+            default_route_interface: None,
+        });
         assert!(
-            matches!(
-                app.engine.connection_state,
-                ConnectionState::Connecting { .. }
-            ),
+            matches!(app.legacy_state(), ConnectionState::Connecting { .. }),
             "Scanner must never demote Connecting -> Disconnected"
         );
     }
@@ -192,7 +200,7 @@ mod connection_state_machine {
 
         app.handle_message(Message::Disconnect);
         assert!(matches!(
-            app.engine.connection_state,
+            app.legacy_state(),
             ConnectionState::Disconnecting { .. }
         ));
     }
@@ -207,10 +215,7 @@ mod connection_state_machine {
             success: true,
             error: None,
         });
-        assert!(matches!(
-            app.engine.connection_state,
-            ConnectionState::Disconnected
-        ));
+        assert!(matches!(app.legacy_state(), ConnectionState::Disconnected));
     }
 
     #[test]
@@ -218,28 +223,30 @@ mod connection_state_machine {
         let mut app = test_app();
         set_disconnecting(&mut app, "vpn-a");
 
-        app.handle_message(Message::SyncSystemState(vec![]));
-        assert!(matches!(
-            app.engine.connection_state,
-            ConnectionState::Disconnected
-        ));
+        app.handle_message(Message::SyncSystemState {
+            sessions: vec![],
+            default_route_interface: None,
+        });
+        assert!(matches!(app.legacy_state(), ConnectionState::Disconnected));
     }
 
     #[test]
     fn disconnecting_safety_timeout() {
-        let mut app = test_app();
-        app.engine.connection_state = ConnectionState::Disconnecting {
-            started: Instant::now()
-                .checked_sub(std::time::Duration::from_secs(31))
-                .unwrap(),
-            profile: "vpn-a".to_string(),
-        };
+        use vortix::vortix_core::profile::ProfileId;
 
-        app.handle_message(Message::SyncSystemState(vec![fake_session("vpn-a")]));
-        assert!(matches!(
-            app.engine.connection_state,
-            ConnectionState::Disconnected
-        ));
+        let mut app = test_app();
+        // Seed the registry as Disconnecting with a 31s back-dated
+        // start so the per-profile scanner's timeout branch fires.
+        set_connected(&mut app, "vpn-a");
+        let past = std::time::SystemTime::now() - std::time::Duration::from_secs(31);
+        app.registry
+            .set_disconnecting(&ProfileId::new("vpn-a"), past);
+
+        app.handle_message(Message::SyncSystemState {
+            sessions: vec![fake_session("vpn-a")],
+            default_route_interface: None,
+        });
+        assert!(matches!(app.legacy_state(), ConnectionState::Disconnected));
     }
 
     #[test]
@@ -248,11 +255,8 @@ mod connection_state_machine {
         set_connecting(&mut app, "vpn-a");
 
         app.handle_message(Message::ConnectionTimeout("vpn-a".to_string()));
-        assert!(matches!(
-            app.engine.connection_state,
-            ConnectionState::Disconnected
-        ));
-        assert!(app.engine.pending_connect.is_none());
+        assert!(matches!(app.legacy_state(), ConnectionState::Disconnected));
+        assert!(app.runtime.pending_connect.is_none());
     }
 
     #[test]
@@ -260,28 +264,26 @@ mod connection_state_machine {
         let mut app = test_app();
         set_connected(&mut app, "vpn-a");
 
-        app.handle_message(Message::SyncSystemState(vec![]));
-        assert!(matches!(
-            app.engine.connection_state,
-            ConnectionState::Disconnected
-        ));
-        assert_eq!(app.engine.connection_drops, 1);
+        app.handle_message(Message::SyncSystemState {
+            sessions: vec![],
+            default_route_interface: None,
+        });
+        assert!(matches!(app.legacy_state(), ConnectionState::Disconnected));
+        assert_eq!(app.runtime.connection_drops, 1);
     }
 
     #[test]
     fn stale_connect_result_ignored() {
         let mut app = test_app();
-        app.engine.connection_state = ConnectionState::Disconnected;
-
+        // No prior Connecting state — the ConnectResult should be ignored.
         app.handle_message(Message::ConnectResult {
             profile: "vpn-a".to_string(),
             success: true,
             error: None,
+            interface: None,
+            pid: None,
         });
-        assert!(matches!(
-            app.engine.connection_state,
-            ConnectionState::Disconnected
-        ));
+        assert!(matches!(app.legacy_state(), ConnectionState::Disconnected));
     }
 
     #[test]
@@ -292,7 +294,7 @@ mod connection_state_machine {
         // Disconnected -> Connecting (simulate connect_profile)
         set_connecting(&mut app, "vpn-a");
         assert!(matches!(
-            app.engine.connection_state,
+            app.legacy_state(),
             ConnectionState::Connecting { .. }
         ));
 
@@ -301,16 +303,18 @@ mod connection_state_machine {
             profile: "vpn-a".to_string(),
             success: true,
             error: None,
+            interface: None,
+            pid: None,
         });
         assert!(matches!(
-            app.engine.connection_state,
+            app.legacy_state(),
             ConnectionState::Connected { .. }
         ));
 
         // Connected -> Disconnecting
         app.handle_message(Message::Disconnect);
         assert!(matches!(
-            app.engine.connection_state,
+            app.legacy_state(),
             ConnectionState::Disconnecting { .. }
         ));
 
@@ -320,22 +324,19 @@ mod connection_state_machine {
             success: true,
             error: None,
         });
-        assert!(matches!(
-            app.engine.connection_state,
-            ConnectionState::Disconnected
-        ));
+        assert!(matches!(app.legacy_state(), ConnectionState::Disconnected));
     }
 
     #[test]
     fn profile_switch_via_pending_connect() {
         let mut app = test_app();
         add_wg_profiles(&mut app, &["vpn-a", "vpn-b"]);
-        app.engine.is_root = true;
+        app.runtime.is_root = true;
 
         // Manually set up the switch scenario: Disconnecting from vpn-a with
         // vpn-b queued. This avoids spawning real disconnect/connect commands.
         set_disconnecting(&mut app, "vpn-a");
-        app.engine.pending_connect = Some(1);
+        app.runtime.pending_connect = Some(1);
 
         // Disconnect completes -> complete_disconnect drains pending_connect
         app.handle_message(Message::DisconnectResult {
@@ -348,16 +349,16 @@ mod connection_state_machine {
         // If wg tools are available, state becomes Connecting to vpn-b.
         // If not, state becomes Disconnected with DependencyError mode.
         let switched = matches!(
-            app.engine.connection_state,
+            app.legacy_state(),
             ConnectionState::Connecting { ref profile, .. } if profile == "vpn-b"
         );
         let dep_error = matches!(app.input_mode, InputMode::DependencyError { .. });
         assert!(
             switched || dep_error,
             "Should auto-connect to vpn-b or show dependency error, got {:?}",
-            app.engine.connection_state
+            app.legacy_state()
         );
-        assert_eq!(app.engine.pending_connect, None);
+        assert_eq!(app.runtime.pending_connect, None);
     }
 }
 
@@ -371,16 +372,16 @@ mod killswitch_lifecycle {
     #[test]
     fn mode_cycling_off_auto_alwayson() {
         let mut app = test_app();
-        assert_eq!(app.engine.killswitch_mode, KillSwitchMode::Off);
+        assert_eq!(app.runtime.killswitch_mode, KillSwitchMode::Off);
 
         app.handle_message(Message::ToggleKillSwitch);
-        assert_eq!(app.engine.killswitch_mode, KillSwitchMode::Auto);
+        assert_eq!(app.runtime.killswitch_mode, KillSwitchMode::Auto);
 
         app.handle_message(Message::ToggleKillSwitch);
-        assert_eq!(app.engine.killswitch_mode, KillSwitchMode::AlwaysOn);
+        assert_eq!(app.runtime.killswitch_mode, KillSwitchMode::AlwaysOn);
 
         app.handle_message(Message::ToggleKillSwitch);
-        assert_eq!(app.engine.killswitch_mode, KillSwitchMode::Off);
+        assert_eq!(app.runtime.killswitch_mode, KillSwitchMode::Off);
     }
 
     #[test]
@@ -388,73 +389,76 @@ mod killswitch_lifecycle {
         let mut app = test_app();
         add_wg_profiles(&mut app, &["vpn-a"]);
         set_connected(&mut app, "vpn-a");
-        app.engine.killswitch_mode = KillSwitchMode::Off;
+        app.runtime.killswitch_mode = KillSwitchMode::Off;
 
         app.handle_message(Message::ToggleKillSwitch); // Off -> Auto
-        assert_eq!(app.engine.killswitch_mode, KillSwitchMode::Auto);
-        assert_eq!(app.engine.killswitch_state, KillSwitchState::Armed);
+        assert_eq!(app.runtime.killswitch_mode, KillSwitchMode::Auto);
+        assert_eq!(app.runtime.killswitch_state, KillSwitchState::Armed);
     }
 
     #[test]
     fn alwayson_blocks_when_disconnected() {
         let mut app = test_app();
-        app.engine.is_root = true;
-        app.engine.killswitch_mode = KillSwitchMode::Auto;
+        app.runtime.is_root = true;
+        app.runtime.killswitch_mode = KillSwitchMode::Auto;
         app.handle_message(Message::ToggleKillSwitch); // Auto -> AlwaysOn
-        assert_eq!(app.engine.killswitch_mode, KillSwitchMode::AlwaysOn);
-        assert_eq!(app.engine.killswitch_state, KillSwitchState::Blocking);
+        assert_eq!(app.runtime.killswitch_mode, KillSwitchMode::AlwaysOn);
+        assert_eq!(app.runtime.killswitch_state, KillSwitchState::Blocking);
     }
 
     #[test]
     fn killswitch_activated_on_vpn_drop() {
         let mut app = test_app();
-        app.engine.is_root = true;
+        app.runtime.is_root = true;
         add_wg_profiles(&mut app, &["vpn-a"]);
-        app.engine.killswitch_mode = KillSwitchMode::Auto;
-        app.engine.killswitch_state = KillSwitchState::Armed;
+        app.runtime.killswitch_mode = KillSwitchMode::Auto;
+        app.runtime.killswitch_state = KillSwitchState::Armed;
         set_connected(&mut app, "vpn-a");
 
         // VPN drops
-        app.handle_message(Message::SyncSystemState(vec![]));
+        app.handle_message(Message::SyncSystemState {
+            sessions: vec![],
+            default_route_interface: None,
+        });
 
-        assert!(matches!(
-            app.engine.connection_state,
-            ConnectionState::Disconnected
-        ));
-        assert_eq!(app.engine.killswitch_state, KillSwitchState::Blocking);
-        assert_eq!(app.engine.connection_drops, 1);
+        assert!(matches!(app.legacy_state(), ConnectionState::Disconnected));
+        assert_eq!(app.runtime.killswitch_state, KillSwitchState::Blocking);
+        assert_eq!(app.runtime.connection_drops, 1);
     }
 
     #[test]
     fn killswitch_stays_disabled_when_mode_off() {
         let mut app = test_app();
-        app.engine.killswitch_mode = KillSwitchMode::Off;
-        app.engine.killswitch_state = KillSwitchState::Disabled;
+        app.runtime.killswitch_mode = KillSwitchMode::Off;
+        app.runtime.killswitch_state = KillSwitchState::Disabled;
         set_connected(&mut app, "vpn-a");
 
         // VPN drops
-        app.handle_message(Message::SyncSystemState(vec![]));
+        app.handle_message(Message::SyncSystemState {
+            sessions: vec![],
+            default_route_interface: None,
+        });
 
-        assert_eq!(app.engine.killswitch_state, KillSwitchState::Disabled);
+        assert_eq!(app.runtime.killswitch_state, KillSwitchState::Disabled);
     }
 
     #[test]
     fn off_mode_disables_killswitch() {
         let mut app = test_app();
-        app.engine.killswitch_mode = KillSwitchMode::AlwaysOn;
-        app.engine.killswitch_state = KillSwitchState::Blocking;
+        app.runtime.killswitch_mode = KillSwitchMode::AlwaysOn;
+        app.runtime.killswitch_state = KillSwitchState::Blocking;
 
         // Toggle to Off
         app.handle_message(Message::ToggleKillSwitch);
-        assert_eq!(app.engine.killswitch_mode, KillSwitchMode::Off);
-        assert_eq!(app.engine.killswitch_state, KillSwitchState::Disabled);
+        assert_eq!(app.runtime.killswitch_mode, KillSwitchMode::Off);
+        assert_eq!(app.runtime.killswitch_state, KillSwitchState::Disabled);
     }
 
     #[test]
     fn quit_cleans_up_killswitch() {
         let mut app = test_app();
-        app.engine.killswitch_mode = KillSwitchMode::AlwaysOn;
-        app.engine.killswitch_state = KillSwitchState::Blocking;
+        app.runtime.killswitch_mode = KillSwitchMode::AlwaysOn;
+        app.runtime.killswitch_state = KillSwitchState::Blocking;
 
         app.handle_message(Message::Quit);
         assert!(app.should_quit);
@@ -463,12 +467,12 @@ mod killswitch_lifecycle {
     #[test]
     fn non_root_cannot_enter_blocking_state() {
         let mut app = test_app();
-        assert!(!app.engine.is_root);
-        app.engine.killswitch_mode = KillSwitchMode::Auto;
+        assert!(!app.runtime.is_root);
+        app.runtime.killswitch_mode = KillSwitchMode::Auto;
         app.handle_message(Message::ToggleKillSwitch); // Auto -> AlwaysOn
-        assert_eq!(app.engine.killswitch_mode, KillSwitchMode::AlwaysOn);
+        assert_eq!(app.runtime.killswitch_mode, KillSwitchMode::AlwaysOn);
         assert_eq!(
-            app.engine.killswitch_state,
+            app.runtime.killswitch_state,
             KillSwitchState::Armed,
             "Non-root should be refused Blocking state"
         );
@@ -625,11 +629,11 @@ mod profile_import {
             path: dir.to_string_lossy().to_string(),
             cursor: 0,
         };
-        let initial = app.engine.profiles.len();
+        let initial = app.runtime.profiles.len();
         app.handle_message(Message::Import(dir.to_string_lossy().to_string()));
 
         assert!(
-            app.engine.profiles.len() > initial,
+            app.runtime.profiles.len() > initial,
             "Should import at least the valid profile"
         );
         assert!(
@@ -760,7 +764,7 @@ mod message_routing {
         assert_eq!(app.profile_list_state.selected(), Some(1));
 
         app.handle_message(Message::ProfileMove(SelectionMove::Last));
-        let last_idx = app.engine.profiles.len() - 1;
+        let last_idx = app.runtime.profiles.len() - 1;
         assert_eq!(app.profile_list_state.selected(), Some(last_idx));
 
         app.handle_message(Message::ProfileMove(SelectionMove::First));
@@ -846,10 +850,7 @@ mod message_routing {
         add_wg_profiles(&mut app, &["vpn-a"]);
 
         app.handle_message(Message::QuickConnect(99));
-        assert!(matches!(
-            app.engine.connection_state,
-            ConnectionState::Disconnected
-        ));
+        assert!(matches!(app.legacy_state(), ConnectionState::Disconnected));
     }
 
     #[test]
@@ -860,7 +861,7 @@ mod message_routing {
         app.handle_message(Message::Telemetry(TelemetryUpdate::PublicIp(
             "1.2.3.4".to_string(),
         )));
-        assert_eq!(app.engine.public_ip, "1.2.3.4");
+        assert_eq!(app.runtime.public_ip, "1.2.3.4");
     }
 
     #[test]
@@ -869,7 +870,7 @@ mod message_routing {
 
         let mut app = test_app();
         app.handle_message(Message::Telemetry(TelemetryUpdate::Latency(42)));
-        assert_eq!(app.engine.latency_ms, 42);
+        assert_eq!(app.runtime.latency_ms, 42);
     }
 
     #[test]
@@ -878,7 +879,7 @@ mod message_routing {
 
         let mut app = test_app();
         app.handle_message(Message::Telemetry(TelemetryUpdate::Ipv6Leak(true)));
-        assert!(app.engine.ipv6_leak);
+        assert!(app.runtime.ipv6_leak);
     }
 
     #[test]

@@ -19,7 +19,7 @@ fn cmd_output(program: &str, args: &[&str]) -> Option<std::process::Output> {
 }
 
 /// Information about an active VPN session detected on the system.
-#[derive(Clone, Default, Debug)]
+#[derive(Clone, Debug)]
 pub struct ActiveSession {
     /// Profile name associated with this session.
     pub name: String,
@@ -29,6 +29,22 @@ pub struct ActiveSession {
     pub started_at: Option<SystemTime>,
     /// System interface name (e.g., utun3, wg0, tun0).
     pub interface: String,
+    /// Whether `interface` came from a reliable per-tunnel source.
+    ///
+    /// `true` when the platform's per-PID iface detection is reliable
+    /// (Linux `/proc/PID/fd/*`, macOS `/var/run/wireguard/<name>.name`
+    /// for WG). `false` only when the scanner fell back to the macOS
+    /// ifconfig-scan heuristic (`check_openvpn_by_pid` Method B), which
+    /// collides across multiple `OpenVPN` PIDs and so cannot
+    /// truthfully identify which utun belongs to which process.
+    /// Consumed by `App::adopt_registry_from_session` (U5) to set the
+    /// new entry's `details.interface_authoritative` flag, which in
+    /// turn excludes unauthoritative adoptions from primary-election.
+    ///
+    /// Defaults to `true` — most platforms / protocols / paths are
+    /// reliable. The macOS `OpenVPN` Method-B fallback is the narrow
+    /// exception that opts out (U5 wires this).
+    pub interface_authoritative: bool,
     /// Internal VPN IP address assigned to this interface.
     pub internal_ip: String,
     /// Remote server endpoint address.
@@ -45,6 +61,50 @@ pub struct ActiveSession {
     pub transfer_tx: String,
     /// Time since last successful handshake.
     pub latest_handshake: String,
+}
+
+impl Default for ActiveSession {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            pid: None,
+            started_at: None,
+            interface: String::new(),
+            interface_authoritative: true,
+            internal_ip: String::new(),
+            endpoint: String::new(),
+            mtu: String::new(),
+            public_key: String::new(),
+            listen_port: String::new(),
+            transfer_rx: String::new(),
+            transfer_tx: String::new(),
+            latest_handshake: String::new(),
+        }
+    }
+}
+
+/// Combined result of a scanner sweep: active VPN sessions plus the
+/// kernel default-route interface (probed in the same background
+/// thread so the main thread doesn't pay the `route get default` cost).
+#[derive(Default, Debug)]
+pub struct ScannerResult {
+    pub sessions: Vec<ActiveSession>,
+    pub default_route_interface: Option<String>,
+}
+
+/// Gather both active VPN sessions and the kernel default-route
+/// interface in one shot. Designed to be called from the scanner's
+/// per-tick background thread. The default-route probe runs through
+/// the same subprocess machinery as the session probes, with the
+/// platform-specific 1s timeout in place (see `route_table.rs`).
+#[must_use]
+pub fn gather_system_state(profiles: &[VpnProfile]) -> ScannerResult {
+    ScannerResult {
+        sessions: get_active_profiles(profiles),
+        default_route_interface: crate::platform::current_platform()
+            .route_table
+            .default_route_interface(),
+    }
 }
 
 /// Scans the system for active VPN sessions matching known profiles.
@@ -124,13 +184,24 @@ fn check_wireguard_by_name(name: &str) -> Option<ActiveSession> {
         return None;
     }
 
-    let interface_name = platform
-        .interface
-        .resolve_wireguard_interface(name)
-        .unwrap_or_else(|| name.to_string());
+    // On macOS, `resolve_wireguard_interface` reads /var/run/wireguard/
+    // <name>.name and returns Some(utunN). On Linux, it returns None
+    // because the kernel device IS the config name — the fallback to
+    // `name.to_string()` is correct. The Some-branch (macOS happy
+    // path) is authoritative; the None fallback is authoritative on
+    // Linux but unauthoritative on macOS (where it indicates an
+    // anomalous wg-quick install / permission state).
+    let resolved = platform.interface.resolve_wireguard_interface(name);
+    let interface_name = resolved.clone().unwrap_or_else(|| name.to_string());
+    // `iface_authoritative` is true when the port returned Some, OR
+    // when we're on Linux (where the port always returns None and the
+    // basename IS the kernel name). The narrow unauthoritative case is
+    // macOS + None — the .name file was missing.
+    let iface_authoritative = resolved.is_some() || cfg!(target_os = "linux");
 
     let mut session = ActiveSession {
         interface: interface_name.clone(),
+        interface_authoritative: iface_authoritative,
         ..Default::default()
     };
 
@@ -241,6 +312,17 @@ fn check_openvpn_by_pid(pid: u32, config_path: &Path) -> Option<ActiveSession> {
     // 2. Find OpenVPN tun/tap interface
     // Method A: Use lsof to find the device file opened by the process (most reliable on macOS)
     let mut detected_iface = String::new();
+    // Tracks whether the interface name written into `session.interface`
+    // came from a per-PID-reliable source. Method A (lsof per PID)
+    // resolves the right utun for THIS process; Method B (ifconfig scan
+    // for "first utun with an inet that isn't WG") cannot distinguish
+    // between multiple OpenVPN PIDs and collides — both PIDs resolve
+    // to the lowest-numbered utun. The flag flows into
+    // `session.interface_authoritative` at session-return time so
+    // `App::adopt_registry_from_session` (U4) can mark the adopted
+    // entry ineligible for primary-election when the iface can't be
+    // trusted against the kernel.
+    let mut iface_authoritative = false;
 
     #[cfg(target_os = "macos")]
     // xtask:allow-platform-cfg: lsof-based OpenVPN tun-iface discovery is macOS-only; Interface port extension deferred
@@ -255,6 +337,10 @@ fn check_openvpn_by_pid(pid: u32, config_path: &Path) -> Option<ActiveSession> {
                         || dev_path.contains("tap")
                     {
                         detected_iface = dev_path.trim_start_matches("/dev/").to_string();
+                        // Method A succeeded — lsof showed THIS PID's
+                        // own /dev/utun fd, so the iface is reliably
+                        // attributable to this process.
+                        iface_authoritative = true;
                         break;
                     }
                 }
@@ -361,6 +447,10 @@ fn check_openvpn_by_pid(pid: u32, config_path: &Path) -> Option<ActiveSession> {
                             session.internal_ip =
                                 parts[1].split('/').next().unwrap_or("").to_string();
                             session.interface.clone_from(&current_iface);
+                            // Linux `ip addr` reliably attributes each
+                            // tun/tap device — no multi-PID collision
+                            // surface like the macOS Method B fallback.
+                            iface_authoritative = true;
                             break;
                         }
                     }
@@ -373,6 +463,17 @@ fn check_openvpn_by_pid(pid: u32, config_path: &Path) -> Option<ActiveSession> {
     if session.interface.is_empty() && !detected_iface.is_empty() {
         session.interface = detected_iface;
     }
+
+    // Record the iface-attribution-reliability decision on the session.
+    // The macOS Method-B fallback (first utun with `inet` that isn't WG)
+    // is the only branch above that leaves `iface_authoritative=false`:
+    // it cannot distinguish between concurrent OpenVPN processes, so
+    // when two are up, both `check_openvpn_by_pid` calls return the
+    // same utun — corrupting primary-election and per-tunnel killswitch
+    // ACCEPT rules if the registry takes that value as authoritative.
+    // R4 of the contract: adopted entries with unreliable iface are
+    // excluded from primary-election by the registry.
+    session.interface_authoritative = iface_authoritative;
 
     // No tun/tap interface means OpenVPN is running but NOT connected yet
     // (still negotiating TLS, authenticating, or has failed silently).
@@ -542,5 +643,24 @@ mod tests {
     fn test_parse_ps_etime_whitespace() {
         assert_eq!(parse_ps_etime("  01:23  "), Some(Duration::from_secs(83)));
         assert_eq!(parse_ps_etime("  5  "), Some(Duration::from_secs(5)));
+    }
+
+    /// `ScannerResult::default()` must produce a sentinel "nothing
+    /// observed yet" value — empty session list AND `None` route
+    /// interface. The registry's `feed_default_route_interface(None)`
+    /// is a legitimate "kernel reports no default route" signal, so
+    /// we need a way to distinguish "scanner ran and saw nothing"
+    /// from the initial pre-scan state. Default supplies the latter.
+    #[test]
+    fn scanner_result_default_is_empty() {
+        let result = ScannerResult::default();
+        assert!(
+            result.sessions.is_empty(),
+            "default ScannerResult must have no sessions"
+        );
+        assert!(
+            result.default_route_interface.is_none(),
+            "default ScannerResult must have no route interface"
+        );
     }
 }

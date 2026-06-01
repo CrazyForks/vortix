@@ -114,6 +114,20 @@ fn main() -> Result<()> {
     // Store the resolved config dir globally so all utility functions use it
     config::set_config_dir(config_dir.clone());
 
+    // Plan #009 U13: session-liveness sweep of `${config_dir}/tmp/`. Any
+    // per-session subdir whose name does not match the current journal
+    // `session_id` is, by construction, a crash orphan — every session has a
+    // unique `{ISO}-{pid}` ID. This is correct regardless of file age (a
+    // crashed session 30 seconds ago is still definitively orphaned because
+    // the pid differs from ours), so no time-based heuristic is used.
+    // Best-effort: failures are swallowed; the temp dir is rebuildable from
+    // the user's profiles on the next connect.
+    if let Some(j) = vortix::vortix_core::journal::global_journal() {
+        if let Some(sid) = j.session_id() {
+            sweep_orphan_temp_configs(&config_dir, &sid);
+        }
+    }
+
     // Plan 006 U4: backfill profile sidecars for `.conf` / `.ovpn` files
     // imported before the sidecar scheme existed. Idempotent — no-ops once
     // every profile has a `.meta.toml`. Failures are logged + non-fatal:
@@ -209,6 +223,37 @@ fn main() -> Result<()> {
     result
 }
 
+/// Sweep crash-orphaned per-session subdirs under `${config_dir}/tmp/`
+/// (plan #009 U13).
+///
+/// Session IDs are `{ISO-timestamp}-{pid}` — guaranteed unique per process —
+/// so any subdir whose name does not match the *current* session's ID is an
+/// orphan from a previous (possibly crashed) run. This is session-liveness,
+/// not age-based: a crash 30 seconds ago still leaves a definitively-orphan
+/// directory, and an age threshold would incorrectly preserve it.
+///
+/// Best-effort: any I/O failure aborts the sweep for the failing entry but
+/// does not prevent startup. The temp dir is fully rebuildable from the
+/// user's profiles on the next secondary connect.
+fn sweep_orphan_temp_configs(config_dir: &std::path::Path, current_session_id: &str) {
+    let tmp_dir = config_dir.join(vortix::constants::TMP_CONFIG_DIR);
+    if !tmp_dir.exists() {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(&tmp_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if name == current_session_id {
+            continue;
+        }
+        let _ = std::fs::remove_dir_all(entry.path());
+    }
+}
+
 /// Prompts the user to migrate data from an old config directory.
 ///
 /// Returns the config directory to use for this session.
@@ -296,50 +341,23 @@ fn run_tui(
     // FSM and gets a per-profile tunnel factory so a single
     // `Engine<TunnelKind>` drives both WG and OVPN. The actor spawns on
     // the bundled tokio runtime. Failure is non-fatal.
+    //
+    // The construction itself lives in `daemon::build_engine_handle` so
+    // both the TUI bootstrap (here) and `vortix daemon` (`handle_daemon`)
+    // produce the same shape.
     if let Some(runtime) = vortix::vortix_process::global_runner().as_real() {
         let _guard = runtime.runtime().handle().enter();
-        if let Some(journal) = vortix::vortix_core::journal::global_journal().cloned() {
-            use vortix::state::Protocol;
-            use vortix::tunnel::{tunnel_for_with_secrets, TunnelKind};
-            use vortix::vortix_config::profile_store::{FsProfileStore, ProfileStore};
-            use vortix::vortix_core::engine::{Engine, EngineHandle};
-            use vortix::vortix_core::profile::{ProfileId, ProtocolKind};
-            use vortix::vortix_protocol_wireguard::WgTunnel;
-
-            // Live profile resolver — reads sidecars via FsProfileStore so
-            // any consumer calling `handle.execute(Connect{id})` sees the
-            // user's actual profiles (post-migration).
-            let resolver_dir = profiles_dir_for_resolver.clone();
-            let resolver = move |id: &ProfileId| {
-                let store = FsProfileStore::new(resolver_dir.clone());
-                store.get(id).ok()
-            };
-
-            // Per-Connect tunnel factory — picks WG vs OVPN from the
-            // resolved profile's protocol. Plan 006 U6's wire-up.
-            let factory_config_dir = vortix::utils::get_app_config_dir()
-                .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"));
-            let factory = move |profile: &vortix::vortix_core::profile::Profile| {
-                let proto = match profile.protocol {
-                    ProtocolKind::OpenVpn => Protocol::OpenVPN,
-                    // Default to WireGuard for any future variants.
-                    _ => Protocol::WireGuard,
-                };
-                tunnel_for_with_secrets(proto, &factory_config_dir, "3", 30)
-            };
-
-            let initial_tunnel = TunnelKind::WireGuard(WgTunnel::new());
-            let engine = Engine::new(initial_tunnel, resolver).with_tunnel_factory(factory);
-            let handle = EngineHandle::local(engine, journal);
+        if let Some(handle) = vortix::daemon::build_engine_handle(&profiles_dir_for_resolver) {
             app = app.with_engine_handle(handle);
 
             // Plan 005 U7: spawn a journal-subscriber task that reacts
             // to engine events. Today it nudges the legacy telemetry
             // worker on `TunnelUp` so connect → IP-refresh happens
             // promptly. Future units route more flows through here.
+            // TUI-only side-effect — the daemon path doesn't need it.
             if let Some(j) = vortix::vortix_core::journal::global_journal() {
                 let mut rx = j.subscribe();
-                let nudge = app.engine.telemetry_nudge.clone();
+                let nudge = app.runtime.telemetry_nudge.clone();
                 tokio::spawn(async move {
                     use vortix::vortix_core::engine::EngineEvent;
                     while let Ok(envelope) = rx.recv().await {
@@ -364,20 +382,22 @@ fn run_tui(
     while !app.should_quit {
         if app.has_active_animation() {
             while let Some(event) = events.try_next()? {
-                match event {
-                    Event::Key(key_event) => app.handle_key(key_event),
-                    Event::Mouse(mouse_event) => app.handle_mouse(mouse_event),
-                    Event::Tick => app.on_tick(),
-                    Event::Resize(w, h) => app.on_resize(w, h),
-                }
+                dispatch_event(&mut app, event);
             }
             app.advance_animation();
         } else {
-            match events.next()? {
-                Event::Key(key_event) => app.handle_key(key_event),
-                Event::Mouse(mouse_event) => app.handle_mouse(mouse_event),
-                Event::Tick => app.on_tick(),
-                Event::Resize(width, height) => app.on_resize(width, height),
+            // Block until at least one event lands (avoids busy-loop), then
+            // drain every event that has already queued up while the
+            // previous render frame was running. A fast trackpad or scroll
+            // wheel can emit 30+ events per second; without this drain,
+            // each event would trigger a full render even though only the
+            // final scroll position matters. Coalescing them into one
+            // render frame is the difference between smooth-scrolling and
+            // the TUI feeling wedged for tens of seconds while it grinds
+            // through a backlog the user already left behind.
+            dispatch_event(&mut app, events.next()?);
+            while let Some(event) = events.try_next()? {
+                dispatch_event(&mut app, event);
             }
         }
 
@@ -397,6 +417,26 @@ fn run_tui(
 /// Initialise tracing-subscriber with an env-filter layer.
 ///
 /// Silent by default; `RUST_LOG=vortix::process=info` enables the structured
+/// Dispatch a single event into the App. Extracted from the main loop
+/// so the loop body can call it once for the blocking-`next()` event
+/// and N more times for each event that's queued up behind it (the
+/// burst-coalescing path that turns rapid scroll-wheel events into a
+/// single render frame).
+///
+/// The `event` is taken by value because the caller is done with it
+/// after dispatch; clippy's `needless_pass_by_value` lint flags the
+/// non-consuming `match` but moving the variant payloads into the
+/// handlers is the right shape here.
+#[allow(clippy::needless_pass_by_value)]
+fn dispatch_event(app: &mut App, event: Event) {
+    match event {
+        Event::Key(key_event) => app.handle_key(key_event),
+        Event::Mouse(mouse_event) => app.handle_mouse(mouse_event),
+        Event::Tick => app.on_tick(),
+        Event::Resize(w, h) => app.on_resize(w, h),
+    }
+}
+
 /// subprocess events emitted by `RealRunner`. The TUI uses stderr for log
 /// output since stdout drives the alternate-screen terminal.
 fn init_tracing() {

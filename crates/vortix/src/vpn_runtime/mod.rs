@@ -1,17 +1,21 @@
-//! Headless VPN engine — owns all VPN state and operations.
+//! Headless VPN runtime — owns telemetry, profiles, config, and worker channels.
 //!
-//! `VpnEngine` holds connection lifecycle, profiles, telemetry data, kill switch
-//! state, retry logic, and background worker channels. It has **zero** ratatui
-//! dependencies, making it usable from both the TUI ([`crate::app::App`]) and
-//! the CLI without pulling in any terminal rendering code.
+//! `VpnRuntime` holds connection-state mirror (CLI-only — TUI consults
+//! `TunnelRegistry`), profiles, telemetry data, kill switch state, retry
+//! logic, and background worker channels. It has **zero** ratatui
+//! dependencies, making it usable from both the TUI ([`crate::app::App`])
+//! and the CLI without pulling in any terminal rendering code.
 //!
-//! The TUI embeds `VpnEngine` inside `App` via `Deref`/`DerefMut`, so all
-//! existing field accesses (`self.profiles`, `app.engine.connection_state`, …) resolve
-//! transparently through the engine.
+//! The TUI embeds `VpnRuntime` as `App.runtime` (no `Deref`); field
+//! accesses go through `self.runtime.X` or `app.runtime.X` explicitly.
 
 pub mod connection;
+pub mod connection_state;
+pub mod openvpn;
 
-use std::collections::VecDeque;
+pub use connection_state::{ConnectionState, DetailedConnectionInfo};
+
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::Instant;
@@ -19,23 +23,22 @@ use std::time::Instant;
 use crate::config::AppConfig;
 use crate::constants;
 use crate::core::network_monitor::NetworkEvent;
-use crate::core::scanner::ActiveSession;
 use crate::core::telemetry::{self, TelemetryUpdate};
 use crate::logger;
 use crate::message::Message;
 use crate::state::{
-    ConnectionState, KillSwitchMode, KillSwitchState, ProfileSortOrder, Protocol, VpnProfile,
+    KillSwitchMode, KillSwitchState, ProfileSortOrder, Protocol, RetryState, VpnProfile,
 };
 use crate::utils;
+use crate::vortix_core::profile::ProfileId;
 
 /// Core VPN engine — all VPN-related state, no UI dependencies.
 ///
-/// Created by [`VpnEngine::new`] for TUI use (spawns background workers) or
-/// [`VpnEngine::new_headless`] for CLI one-shot commands (no background threads).
+/// Created by [`VpnRuntime::new`] for TUI use (spawns background workers) or
+/// [`VpnRuntime::new_headless`] for CLI one-shot commands (no background threads).
 #[allow(clippy::struct_excessive_bools)]
-pub struct VpnEngine {
+pub struct VpnRuntime {
     // === VPN State ===
-    pub connection_state: ConnectionState,
     pub profiles: Vec<VpnProfile>,
     pub session_start: Option<Instant>,
 
@@ -60,6 +63,24 @@ pub struct VpnEngine {
     pub ip_unchanged_warned: bool,
     pub last_connected_profile: Option<String>,
 
+    /// True once the scanner has completed at least one
+    /// `Message::SyncSystemState` tick. Until then we don't know
+    /// whether the kernel has any active VPN interfaces, so the
+    /// real-IP cache gate must withhold trust on the first
+    /// telemetry sample. Without this flag, vortix opened while a
+    /// VPN is already up races: telemetry returns the VPN's exit
+    /// IP, the registry is briefly empty (adoption hasn't run
+    /// yet), and the wrong IP gets cached as `real_ip`.
+    pub scanner_first_tick_done: bool,
+
+    /// Number of kernel-visible VPN sessions observed at the most
+    /// recent scanner tick. Reading raw kernel state (not the
+    /// registry) catches tunnels that have not yet been adopted —
+    /// e.g. an OVPN process running outside vortix on macOS where
+    /// adoption needs the lsof Method A probe to attribute the
+    /// iface to the PID. Real-IP caching requires this to be zero.
+    pub last_kernel_session_count: usize,
+
     // === Configuration ===
     pub config: AppConfig,
     pub config_dir: PathBuf,
@@ -75,23 +96,25 @@ pub struct VpnEngine {
     pub killswitch_state: KillSwitchState,
 
     // === Connection Retry & Auto-Reconnect ===
-    pub retry_count: u32,
-    pub retry_profile_idx: Option<usize>,
-    pub auto_reconnect_profile: Option<usize>,
+    /// Per-profile retry / auto-reconnect bookkeeping (plan P5b U-P5b-1).
+    /// Replaces the single-slot retry triple. Each profile retries
+    /// independently — a failed connect on A no longer blocks or
+    /// overwrites an in-flight retry on B.
+    pub retry_state: HashMap<ProfileId, RetryState>,
 
     // === Async Communication ===
     pub(crate) telemetry_rx: Option<mpsc::Receiver<TelemetryUpdate>>,
     pub telemetry_nudge: Option<mpsc::Sender<()>>,
     pub(crate) cmd_tx: mpsc::Sender<Message>,
     pub(crate) cmd_rx: mpsc::Receiver<Message>,
-    pub(crate) scanner_rx: Option<mpsc::Receiver<Vec<ActiveSession>>>,
+    pub(crate) scanner_rx: Option<mpsc::Receiver<crate::core::scanner::ScannerResult>>,
     pub(crate) netmon_rx: Option<mpsc::Receiver<NetworkEvent>>,
     pub(crate) netstats_rx: Option<mpsc::Receiver<(u64, u64)>>,
     pub(crate) last_bytes_in: u64,
     pub(crate) last_bytes_out: u64,
 }
 
-impl VpnEngine {
+impl VpnRuntime {
     /// Create an engine with background workers (telemetry, scanner, network monitor).
     ///
     /// Use this constructor when the engine will be long-lived (TUI mode).
@@ -101,7 +124,6 @@ impl VpnEngine {
         let history_size = constants::NETWORK_HISTORY_SIZE;
 
         let mut engine = Self {
-            connection_state: ConnectionState::Disconnected,
             profiles: Vec::new(),
             session_start: None,
 
@@ -123,6 +145,8 @@ impl VpnEngine {
             last_security_check: None,
             ip_unchanged_warned: false,
             last_connected_profile: None,
+            scanner_first_tick_done: false,
+            last_kernel_session_count: 0,
 
             config,
             config_dir,
@@ -135,9 +159,7 @@ impl VpnEngine {
             killswitch_mode: KillSwitchMode::default(),
             killswitch_state: KillSwitchState::default(),
 
-            retry_count: 0,
-            retry_profile_idx: None,
-            auto_reconnect_profile: None,
+            retry_state: HashMap::new(),
 
             telemetry_rx: None,
             telemetry_nudge: None,
@@ -162,6 +184,16 @@ impl VpnEngine {
             }
         }
 
+        // Restore real_ip from the on-disk cache. Handles the
+        // "launch vortix with VPN already up" case where the
+        // current process has no disconnected window to learn the
+        // real IP from telemetry. Stale loads are acceptable — a
+        // fresh disconnected sample will overwrite the cache the
+        // moment the user disconnects.
+        if let Some(cached) = crate::core::real_ip_cache::load(&engine.config_dir) {
+            engine.real_ip = Some(cached.ip);
+        }
+
         // Load profiles
         engine.profiles = crate::vpn::load_profiles();
 
@@ -181,7 +213,6 @@ impl VpnEngine {
         let history_size = constants::NETWORK_HISTORY_SIZE;
 
         let mut engine = Self {
-            connection_state: ConnectionState::Disconnected,
             profiles: Vec::new(),
             session_start: None,
 
@@ -203,6 +234,8 @@ impl VpnEngine {
             last_security_check: None,
             ip_unchanged_warned: false,
             last_connected_profile: None,
+            scanner_first_tick_done: false,
+            last_kernel_session_count: 0,
 
             config,
             config_dir,
@@ -215,9 +248,7 @@ impl VpnEngine {
             killswitch_mode: KillSwitchMode::default(),
             killswitch_state: KillSwitchState::default(),
 
-            retry_count: 0,
-            retry_profile_idx: None,
-            auto_reconnect_profile: None,
+            retry_state: HashMap::new(),
 
             telemetry_rx: None,
             telemetry_nudge: None,
@@ -253,7 +284,6 @@ impl VpnEngine {
         let (cmd_tx, cmd_rx) = mpsc::channel::<Message>();
         let history_size = constants::NETWORK_HISTORY_SIZE;
         Self {
-            connection_state: ConnectionState::Disconnected,
             profiles: Vec::new(),
             session_start: None,
             down_history: VecDeque::from(vec![0.0; history_size]),
@@ -273,6 +303,8 @@ impl VpnEngine {
             last_security_check: None,
             ip_unchanged_warned: false,
             last_connected_profile: None,
+            scanner_first_tick_done: false,
+            last_kernel_session_count: 0,
             config: AppConfig::default(),
             config_dir: std::env::temp_dir().join("vortix_test"),
             is_root: false,
@@ -281,9 +313,7 @@ impl VpnEngine {
             sort_order: ProfileSortOrder::default(),
             killswitch_mode: KillSwitchMode::Off,
             killswitch_state: KillSwitchState::Disabled,
-            retry_count: 0,
-            retry_profile_idx: None,
-            auto_reconnect_profile: None,
+            retry_state: HashMap::new(),
             telemetry_rx: None,
             telemetry_nudge: None,
             cmd_tx,
@@ -424,29 +454,67 @@ impl VpnEngine {
         }
     }
 
-    /// Synchronizes the kill switch state with the current mode and connection status.
-    pub fn sync_killswitch(&mut self) {
+    /// Build the `(is_connected, active_tunnels)` pair from the
+    /// scanner's view of the kernel — every kernel-visible tunnel
+    /// contributes one entry, regardless of which surface (TUI or
+    /// CLI) initiated it. CLI-side callers feed this into
+    /// `sync_killswitch` so the persisted slice always reflects every
+    /// active tunnel, not just the one the current CLI invocation
+    /// touched.
+    ///
+    /// Marks every entry as `is_primary: true` because the headless
+    /// CLI has no registry-derived primary; the killswitch's
+    /// firewall rules treat each Connected interface as a tunnel
+    /// that must allow its server IP and DNS through. The TUI
+    /// computes a multi-tunnel slice (`App::active_tunnels_for_killswitch`)
+    /// with proper primary marking from registry state.
+    #[must_use]
+    pub fn killswitch_view_from_scanner(
+        &self,
+    ) -> (bool, Vec<crate::core::killswitch::ActiveTunnelInfo>) {
+        let sessions = crate::core::scanner::get_active_profiles(&self.profiles);
+        let is_connected = !sessions.is_empty();
+        let active_tunnels = sessions
+            .iter()
+            .map(|s| crate::core::killswitch::ActiveTunnelInfo {
+                interface: s.interface.clone(),
+                server_ips: s
+                    .endpoint
+                    .split(':')
+                    .next()
+                    .and_then(|h| h.parse().ok())
+                    .into_iter()
+                    .collect(),
+                declared_cidrs: Vec::new(),
+                is_primary: true,
+            })
+            .collect();
+        (is_connected, active_tunnels)
+    }
+
+    /// Synchronizes the kill switch state with the current mode and
+    /// connection status.
+    ///
+    /// Plan P5d: callers compute `is_connected` and `active_tunnels`
+    /// from their own state. App-side callers derive both from
+    /// `app.registry`; CLI-side callers use
+    /// [`Self::killswitch_view_from_scanner`] so every CLI lifecycle
+    /// helper persists the full multi-tunnel slice, not a synthesised
+    /// single-tunnel view that would clobber the on-disk state when
+    /// another tunnel is still up.
+    pub fn sync_killswitch(
+        &mut self,
+        is_connected: bool,
+        active_tunnels: &[crate::core::killswitch::ActiveTunnelInfo],
+    ) {
         let old_state = self.killswitch_state;
 
-        self.killswitch_state = match self.killswitch_mode {
-            KillSwitchMode::Off => KillSwitchState::Disabled,
-            KillSwitchMode::Auto => {
-                if matches!(self.connection_state, ConnectionState::Connected { .. }) {
-                    KillSwitchState::Armed
-                } else if old_state == KillSwitchState::Blocking {
-                    KillSwitchState::Blocking
-                } else {
-                    KillSwitchState::Armed
-                }
-            }
-            KillSwitchMode::AlwaysOn => {
-                if matches!(self.connection_state, ConnectionState::Connected { .. }) {
-                    KillSwitchState::Armed
-                } else {
-                    KillSwitchState::Blocking
-                }
-            }
-        };
+        // Pure mode → state decision lives on `KillSwitchMode` so it
+        // can be unit-tested without firewall side effects. AlwaysOn
+        // always resolves to Blocking — the firewall stays engaged
+        // whether the VPN is up or down (canonical Linux killswitch
+        // shape; see `tests/integration/killswitch.sh`).
+        self.killswitch_state = self.killswitch_mode.desired_state(old_state, is_connected);
 
         if self.killswitch_state.is_blocking() && !self.is_root {
             self.killswitch_state = KillSwitchState::Armed;
@@ -455,15 +523,7 @@ impl VpnEngine {
         if self.killswitch_state != old_state || self.killswitch_state == KillSwitchState::Blocking
         {
             if self.killswitch_state.is_blocking() {
-                let (interface, server_ip) = match &self.connection_state {
-                    ConnectionState::Connected { details, .. } => (
-                        details.interface.as_str(),
-                        Some(details.endpoint.split(':').next().unwrap_or("")),
-                    ),
-                    _ => (crate::platform::DEFAULT_VPN_INTERFACE, None),
-                };
-
-                if let Err(e) = crate::core::killswitch::enable_blocking(interface, server_ip) {
+                if let Err(e) = crate::core::killswitch::enable_blocking_multi(active_tunnels) {
                     logger::log(
                         logger::LogLevel::Warning,
                         "SEC",
@@ -481,15 +541,20 @@ impl VpnEngine {
             }
         }
 
+        let persisted_tunnels = crate::core::killswitch::persisted_from_active(active_tunnels);
         let _ = crate::core::killswitch::save_state(
             self.killswitch_mode,
             self.killswitch_state,
-            None,
-            None,
+            persisted_tunnels,
         );
     }
 
     /// Check if required binaries are available for a given protocol.
+    ///
+    /// Shared between TUI and CLI so both surfaces refuse the same
+    /// missing-dep set (and run the same `OpenVPN` 2.4+ probe — older
+    /// builds silently drop `--pull-filter`, breaking multi-tunnel DNS
+    /// scoping per plan 001 U14 / R13).
     #[must_use]
     pub fn check_dependencies(protocol: Protocol, config_path: &std::path::Path) -> Vec<String> {
         let mut missing = Vec::new();
@@ -519,7 +584,32 @@ impl VpnEngine {
                 let _ = config_path; // suppress unused warning on non-Linux
             }
             Protocol::OpenVPN => {
-                if !utils::binary_exists("openvpn") {
+                if utils::binary_exists("openvpn") {
+                    // Assert OpenVPN ≥ 2.4 so `--pull-filter` (multi-tunnel
+                    // DNS scoping) is available. Older builds silently
+                    // ignore the flag and leak pushed DNS into the primary
+                    // tunnel's resolver. Unparseable probe = fail-open with
+                    // a tracing warning so vendor-patched or sandboxed
+                    // environments aren't blocked.
+                    use openvpn::OvpnVersionProbe;
+                    match openvpn::probe_openvpn_version() {
+                        OvpnVersionProbe::Parsed(v) if v.supports_multi_tunnel_dns() => {}
+                        OvpnVersionProbe::Parsed(v) => {
+                            missing.push(format!(
+                                "openvpn 2.4+ required for multi-tunnel DNS scoping (found {v})"
+                            ));
+                        }
+                        OvpnVersionProbe::HelpFallbackOk => {}
+                        OvpnVersionProbe::Unparseable => {
+                            tracing::warn!(
+                                target: "vortix::vpn_runtime",
+                                "openvpn version could not be determined; \
+                                 multi-tunnel DNS scoping may not work if the \
+                                 installed binary is older than 2.4"
+                            );
+                        }
+                    }
+                } else {
                     missing.push("openvpn".to_string());
                 }
             }
@@ -528,7 +618,7 @@ impl VpnEngine {
     }
 }
 
-impl Drop for VpnEngine {
+impl Drop for VpnRuntime {
     fn drop(&mut self) {
         // VPN connections are independent OS processes (wg-quick, openvpn) that
         // should survive UI process exit. Only explicit user actions (disconnect

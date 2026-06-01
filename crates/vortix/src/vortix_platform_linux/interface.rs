@@ -1,4 +1,9 @@
-//! Linux VPN interface detection via `ip addr` and `wg show`.
+//! Linux VPN interface detection via `libc::getifaddrs` + `/sys/class/net` + `wg show`.
+//!
+//! Plan 002 U4: replaced the `ip addr show <iface>` shell-out with a direct
+//! `libc::getifaddrs` walk for IPv4 address discovery and a `/sys/class/net/<iface>/mtu`
+//! read for MTU. No more parsing of human-formatted `ip` output; no PATH dependency
+//! on iproute2 for read-only interface inspection.
 
 use crate::vortix_core::ports::interface::Interface;
 use crate::vortix_process::CommandSpec;
@@ -12,13 +17,14 @@ fn cmd_output(program: &str, args: &[&str]) -> Option<std::process::Output> {
     crate::vortix_process::run_to_output(CommandSpec::oneshot(program, owned)).ok()
 }
 
-/// Linux interface detection using `ip addr`, `wg show`, and standard interface naming.
+/// Linux interface detection using `libc::getifaddrs`, `/sys/class/net`, and `wg show`.
 pub struct LinuxInterface;
 
 impl Interface for LinuxInterface {
     fn check_wireguard_interface(name: &str) -> bool {
         // On Linux, WireGuard creates interfaces directly (wg0, wg1, etc.)
-        // Also check using `wg show` which works for kernel and userspace WireGuard
+        // Also check using `wg show` which works for kernel and userspace WireGuard.
+        // `wg` stays a shell-out (it's the irreducible WireGuard tool).
         check_wg_interface_exists(name)
     }
 
@@ -47,36 +53,20 @@ impl Interface for LinuxInterface {
     }
 
     fn get_wireguard_pid(interface: &str) -> Option<u32> {
-        // On Linux, kernel WireGuard doesn't have a userspace process
-        // For wireguard-go (userspace), search via ps
-        if let Some(output) = cmd_output("ps", &["-eo", "pid,args"]) {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            for line in stdout.lines() {
-                let line_lower = line.to_lowercase();
-                if line_lower.contains("wireguard")
-                    && line_lower.contains(&interface.to_lowercase())
-                {
-                    let parts: Vec<&str> = line.split_whitespace().collect();
-                    if let Some(pid_str) = parts.first() {
-                        if let Ok(pid) = pid_str.parse::<u32>() {
-                            return Some(pid);
-                        }
-                    }
-                }
-            }
-        }
-
-        None
+        // Plan 002 U6: walk /proc directly instead of shelling to `ps`.
+        // Kernel WG has no userspace PID (returns None); wireguard-go has
+        // a process whose cmdline contains both "wireguard" and the
+        // interface name.
+        find_pid_with_cmdline_substrings(&["wireguard", interface])
     }
 
     fn get_interface_info(interface: &str) -> (String, String) {
-        // Use `ip addr show {interface}` on Linux
-        if let Some(output) = cmd_output("ip", &["addr", "show", interface]) {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            return parse_ip_addr_output(&stdout);
-        }
-
-        (String::new(), String::new())
+        // Plan 002 U4: IPv4 address from libc::getifaddrs; MTU from sysfs.
+        // Used to shell to `ip addr show <iface>` and parse the human-
+        // formatted output — both are direct kernel reads now.
+        let ip = get_interface_ipv4(interface).unwrap_or_default();
+        let mtu = read_sysfs_mtu(interface).unwrap_or_default();
+        (ip, mtu)
     }
 }
 
@@ -84,65 +74,179 @@ fn check_wg_interface_exists(name: &str) -> bool {
     cmd_output("wg", &["show", name, "public-key"]).is_some_and(|o| o.status.success())
 }
 
-/// Parse `ip addr show {iface}` output to extract `(ip, mtu)`.
-pub(crate) fn parse_ip_addr_output(output: &str) -> (String, String) {
-    let mut ip = String::new();
-    let mut mtu = String::new();
+/// Walk `/proc/[pid]/cmdline` and return the first PID whose cmdline
+/// contains ALL of the given substring needles (case-insensitive).
+///
+/// Replaces the `ps -eo pid,args` shell-out used for finding userspace
+/// `WireGuard` processes (wireguard-go). Pure stdlib; no PATH dependency
+/// on procps.
+///
+/// Plan 002 U6.
+pub(crate) fn find_pid_with_cmdline_substrings(needles: &[&str]) -> Option<u32> {
+    let needles_lower: Vec<String> = needles.iter().map(|n| n.to_lowercase()).collect();
 
-    for line in output.lines() {
-        let trimmed = line.trim();
-        // MTU is on the first line: "4: wg0: <POINTOPOINT,NOARP,UP,LOWER_UP> mtu 1420 ..."
-        if trimmed.contains("mtu ") && mtu.is_empty() {
-            if let Some(mtu_idx) = trimmed.find("mtu ") {
-                let rest = &trimmed[mtu_idx + 4..];
-                if let Some(val) = rest.split_whitespace().next() {
-                    mtu = val.to_string();
-                }
-            }
-        }
-        // IP is on an "inet " line: "    inet 10.0.0.2/32 scope global wg0"
-        if trimmed.starts_with("inet ") && ip.is_empty() {
-            let parts: Vec<&str> = trimmed.split_whitespace().collect();
-            if parts.len() >= 2 {
-                // Strip CIDR notation if present
-                ip = parts[1].split('/').next().unwrap_or("").to_string();
-            }
+    let entries = std::fs::read_dir("/proc").ok()?;
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else {
+            continue;
+        };
+        // Skip non-PID entries (those are numeric).
+        let Ok(pid) = name.parse::<u32>() else {
+            continue;
+        };
+        // cmdline is null-separated; replace with spaces for substring
+        // matching against the legacy `ps args` format.
+        let cmdline_path = format!("/proc/{pid}/cmdline");
+        let Ok(raw) = std::fs::read(&cmdline_path) else {
+            continue; // PID disappeared between readdir and read — fine
+        };
+        let cmdline = String::from_utf8_lossy(&raw)
+            .replace('\0', " ")
+            .to_lowercase();
+        if needles_lower.iter().all(|n| cmdline.contains(n)) {
+            return Some(pid);
         }
     }
+    None
+}
 
-    (ip, mtu)
+/// Walk `/proc/[pid]/cmdline` and return EVERY PID whose cmdline contains
+/// the given substring needle (case-insensitive).
+///
+/// Used by the OVPN tunnel teardown to replace `pkill -f`. Same /proc
+/// walk as the single-PID variant but collects all matches.
+///
+/// Plan 002 U6.
+pub(crate) fn find_all_pids_with_cmdline_substring(needle: &str) -> Vec<u32> {
+    let needle_lower = needle.to_lowercase();
+    let mut matches = Vec::new();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return matches;
+    };
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else {
+            continue;
+        };
+        let Ok(pid) = name.parse::<u32>() else {
+            continue;
+        };
+        let cmdline_path = format!("/proc/{pid}/cmdline");
+        let Ok(raw) = std::fs::read(&cmdline_path) else {
+            continue;
+        };
+        let cmdline = String::from_utf8_lossy(&raw)
+            .replace('\0', " ")
+            .to_lowercase();
+        if cmdline.contains(&needle_lower) {
+            matches.push(pid);
+        }
+    }
+    matches
+}
+
+/// Read the IPv4 address assigned to `interface` from `libc::getifaddrs`.
+///
+/// Returns the first `AF_INET` address encountered for the named interface,
+/// matching the prior parser's behavior (it picked the first `inet ` line
+/// out of `ip addr show` output). Returns `None` when the interface has
+/// no IPv4 address, doesn't exist, or `getifaddrs` itself fails.
+///
+/// Plan 002 U4.
+fn get_interface_ipv4(interface: &str) -> Option<String> {
+    // SAFETY: libc::getifaddrs writes a *mut *mut ifaddrs into `ifap`.
+    // We pass a stack-rooted null pointer; on success the kernel
+    // allocates a linked list we MUST release via freeifaddrs.
+    // Returns 0 on success, -1 on error (no allocation done on error).
+    #[allow(unsafe_code)]
+    unsafe {
+        let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
+        if libc::getifaddrs(&raw mut ifap) != 0 {
+            return None;
+        }
+
+        let mut result: Option<String> = None;
+        let mut current = ifap;
+        while !current.is_null() {
+            let entry = &*current;
+            if !entry.ifa_name.is_null() {
+                let name_cstr = std::ffi::CStr::from_ptr(entry.ifa_name);
+                if name_cstr.to_bytes() == interface.as_bytes() && !entry.ifa_addr.is_null() {
+                    let addr = &*entry.ifa_addr;
+                    if i32::from(addr.sa_family) == libc::AF_INET {
+                        // Cast to sockaddr_in; extract the 4-byte network-
+                        // order address; format as dotted-decimal.
+                        // sockaddr_in alignment (4) is stricter than sockaddr (2 on
+                        // Linux), but getifaddrs guarantees alignment when sa_family
+                        // is AF_INET. The cast is safe in this branch.
+                        #[allow(clippy::cast_ptr_alignment)]
+                        let sin = entry.ifa_addr.cast::<libc::sockaddr_in>();
+                        let bytes = (*sin).sin_addr.s_addr.to_ne_bytes();
+                        result = Some(format!(
+                            "{}.{}.{}.{}",
+                            bytes[0], bytes[1], bytes[2], bytes[3]
+                        ));
+                        break;
+                    }
+                }
+            }
+            current = entry.ifa_next;
+        }
+
+        libc::freeifaddrs(ifap);
+        result
+    }
+}
+
+/// Read the MTU value for `interface` from `/sys/class/net/<iface>/mtu`.
+///
+/// Returns the MTU as a String (e.g. `"1420"`), trimmed of trailing
+/// newline. Returns `None` when the sysfs file is unreadable (interface
+/// doesn't exist, no permission, or kernel without sysfs).
+///
+/// Plan 002 U4.
+fn read_sysfs_mtu(interface: &str) -> Option<String> {
+    let path = format!("/sys/class/net/{interface}/mtu");
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::parse_ip_addr_output;
+    use super::*;
+
+    // Plan 002 U4: the previous `parse_ip_addr_output` tests asserted
+    // string-parsing of human-formatted `ip addr show` output. That
+    // parser is gone; tests are obsolete. The new implementation
+    // exercises libc::getifaddrs + sysfs reads, which depend on real
+    // kernel state — those go in the integration suite, not here.
 
     #[test]
-    fn test_parse_ip_addr_output_wireguard() {
-        let output = "4: wg0: <POINTOPOINT,NOARP,UP,LOWER_UP> mtu 1420 qdisc noqueue state UNKNOWN group default qlen 1000
-    link/none
-    inet 10.0.0.2/32 scope global wg0
-       valid_lft forever preferred_lft forever";
-        let (ip, mtu) = parse_ip_addr_output(output);
-        assert_eq!(ip, "10.0.0.2");
-        assert_eq!(mtu, "1420");
+    fn get_interface_ipv4_returns_none_for_nonexistent_interface() {
+        let result = get_interface_ipv4("vortix-nonexistent-test-iface-xyz");
+        assert!(result.is_none());
     }
 
     #[test]
-    fn test_parse_ip_addr_output_tun() {
-        let output = "5: tun0: <POINTOPOINT,MULTICAST,NOARP,UP,LOWER_UP> mtu 1500 qdisc fq_codel state UNKNOWN group default qlen 500
-    link/none
-    inet 10.8.0.6 peer 10.8.0.5/32 scope global tun0
-       valid_lft forever preferred_lft forever";
-        let (ip, mtu) = parse_ip_addr_output(output);
-        assert_eq!(ip, "10.8.0.6");
-        assert_eq!(mtu, "1500");
+    fn read_sysfs_mtu_returns_none_for_nonexistent_interface() {
+        let result = read_sysfs_mtu("vortix-nonexistent-test-iface-xyz");
+        assert!(result.is_none());
     }
 
     #[test]
-    fn test_parse_ip_addr_output_empty() {
-        let (ip, mtu) = parse_ip_addr_output("");
-        assert_eq!(ip, "");
-        assert_eq!(mtu, "");
+    fn get_interface_info_for_loopback_returns_known_values() {
+        // `lo` exists in every Linux environment + every macOS env where
+        // this file might be compiled. On Linux it's named `lo`; the
+        // file is cfg-gated to Linux at the module level so the test
+        // assumes Linux.
+        let (ip, mtu) = LinuxInterface::get_interface_info("lo");
+        assert_eq!(ip, "127.0.0.1", "loopback IPv4 should be 127.0.0.1");
+        assert!(
+            mtu.parse::<u32>().is_ok(),
+            "loopback MTU should be a parseable integer; got: {mtu}"
+        );
     }
 }

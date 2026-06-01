@@ -66,6 +66,13 @@ pub struct Engine<T: Tunnel> {
     /// triggers `EngineError::ProfileNotFound` semantics (today we just
     /// transition to `Disconnected { last_failure: ProfileGone }`).
     profile_resolver: ProfileResolver,
+    /// Queued-connect slot used by `TunnelRegistry` when a user requests
+    /// "connect B" while this FSM (A) is mid-`Disconnecting`. The registry
+    /// stashes B's `ProfileId` here; when the registry observes A reaching
+    /// `Disconnected`, it fires the queued connect and clears the slot.
+    /// Plan #001 (multi-connection) U5 §6.6 race row. `None` in single-tunnel
+    /// mode.
+    pending_after_disconnect: Option<ProfileId>,
 }
 
 impl<T: Tunnel> Engine<T> {
@@ -80,6 +87,7 @@ impl<T: Tunnel> Engine<T> {
             tunnel_factory: None,
             settings: EngineSettings::default(),
             profile_resolver: Box::new(profile_resolver),
+            pending_after_disconnect: None,
         }
     }
 
@@ -102,6 +110,113 @@ impl<T: Tunnel> Engine<T> {
     #[must_use]
     pub fn state(&self) -> &Connection {
         &self.state
+    }
+
+    /// Profile currently in scope (`None` only when `Disconnected`).
+    ///
+    /// Convenience accessor for `self.state().profile_id().cloned()` used by
+    /// `TunnelRegistry` when enumerating snapshots.
+    #[must_use]
+    pub fn profile_id(&self) -> Option<ProfileId> {
+        self.state.profile_id().cloned()
+    }
+
+    /// The `ProfileId` queued to be connected once this FSM reaches
+    /// `Disconnected`. See `pending_after_disconnect` field doc.
+    #[must_use]
+    pub fn pending_after_disconnect(&self) -> Option<&ProfileId> {
+        self.pending_after_disconnect.as_ref()
+    }
+
+    /// Stash a queued-connect target for the registry to fire once this FSM
+    /// finishes its current `Disconnecting` transition.
+    pub fn set_pending_after_disconnect(&mut self, profile_id: Option<ProfileId>) {
+        self.pending_after_disconnect = profile_id;
+    }
+
+    /// Bookkeeping-only: seed `Connection::Connected` directly from a
+    /// pre-populated `DetailedConnectionInfo` without driving
+    /// `Tunnel::up`. The supplied state replaces whatever the FSM
+    /// currently holds — no transition guards, no events emitted, no
+    /// tunnel invocation.
+    ///
+    /// This exists to mirror externally-driven kernel state (e.g. a
+    /// VPN brought up by the legacy `App::connect_profile_inner`
+    /// spawned-thread path, or an interface adopted from a prior
+    /// vortix session) into the registry until plan 001 U7 routes
+    /// the full connect flow through `EngineHandle::Local`. Once U7
+    /// lands, every Connected entry will arrive via
+    /// `handle(UserCommand::Connect)` and this seed API can be
+    /// retired.
+    ///
+    /// Use [`TunnelRegistry::set_connected`] from outside the FSM
+    /// rather than calling this directly — the registry call also
+    /// refreshes the derived `primary` after seeding.
+    pub fn seed_connected_state(
+        &mut self,
+        profile_id: ProfileId,
+        details: DetailedConnectionInfo,
+        since: SystemTime,
+    ) {
+        self.state = Connection::Connected {
+            profile_id,
+            since,
+            health: crate::vortix_core::engine::state::ConnectionHealth::default(),
+            details: Box::new(details),
+        };
+    }
+
+    /// Bookkeeping-only counterpart to [`Self::seed_connected_state`]:
+    /// drop straight back to `Disconnected { last_failure: None }`
+    /// without running the `Disconnecting` transition or invoking
+    /// `Tunnel::down`. Used by [`TunnelRegistry::set_disconnected`]
+    /// when the App's legacy disconnect path has already torn down
+    /// the kernel state.
+    pub fn seed_disconnected_state(&mut self) {
+        self.state = Connection::Disconnected { last_failure: None };
+    }
+
+    /// Bookkeeping-only: seed `Connection::Connecting` directly. Used by
+    /// [`TunnelRegistry::set_connecting`] when the legacy connect path
+    /// (`App::connect_profile_inner`) sets its single-tunnel
+    /// `ConnectionState = Connecting{...}` and we need the registry to
+    /// reflect the in-flight attempt so sidebar / header render the
+    /// `◐` badge during the connect window.
+    pub fn seed_connecting_state(
+        &mut self,
+        profile_id: ProfileId,
+        started_at: SystemTime,
+        attempt: u32,
+        retry_budget_remaining: Duration,
+    ) {
+        self.state = Connection::Connecting {
+            profile_id,
+            started_at,
+            attempt,
+            retry_budget_remaining,
+        };
+    }
+
+    /// Bookkeeping-only: seed `Connection::Disconnecting`. Used when the
+    /// legacy `disconnect()` flow kicks off and we want the sidebar
+    /// `◑` badge to show during the teardown window (between the user
+    /// pressing `d` and the worker thread's `DisconnectResult`
+    /// arriving).
+    pub fn seed_disconnecting_state(&mut self, profile_id: ProfileId, started_at: SystemTime) {
+        self.state = Connection::Disconnecting {
+            profile_id,
+            started_at,
+        };
+    }
+
+    /// Bookkeeping-only: seed `Connection::Disconnected` with a specific
+    /// failure reason. Used when the legacy `handle_connect_result`
+    /// failure branch fires and we want the sidebar `✗` badge to mark
+    /// the failed attempt until the user retries or dismisses.
+    pub fn seed_failed_state(&mut self, failure: crate::vortix_core::engine::state::FailureReason) {
+        self.state = Connection::Disconnected {
+            last_failure: Some(failure),
+        };
     }
 
     /// Drive one input through the FSM. Returns the events emitted during
@@ -127,8 +242,15 @@ impl<T: Tunnel> Engine<T> {
     fn handle_user_command(&mut self, cmd: UserCommand, events: &mut Vec<EngineEvent>) {
         match cmd {
             UserCommand::Connect { profile_id } => self.try_connect(profile_id, events),
-            UserCommand::Disconnect | UserCommand::ForceDisconnect => self.try_disconnect(events),
-            UserCommand::Reconnect => self.try_reconnect(events),
+            // The single FSM drives one tunnel. `profile_id` on the
+            // multi-tunnel variants is a registry-level routing key —
+            // by the time the command reaches a single FSM, the
+            // registry has already selected which FSM to drive. The
+            // FSM itself ignores the field.
+            UserCommand::Disconnect { .. } | UserCommand::ForceDisconnect { .. } => {
+                self.try_disconnect(events);
+            }
+            UserCommand::Reconnect { .. } => self.try_reconnect(events),
             // Plan 008 U2: slot reserved for the 2FA flow (issue #191).
             // No consumer wired in v0.3.0 — answer is dropped silently
             // because no `AwaitingUserInput` transition emits the

@@ -55,9 +55,23 @@ pub struct CommandSpec {
     pub kind: Kind,
     /// Arg indices to redact in `tracing` audit logs. Used by callers that pass
     /// secret material (e.g., file paths in `/tmp/vortix-*.conf`) as args.
-    /// Today vortix has no such callsite; the field is reserved for plan 006's
-    /// SecretStore-aware Tunnel impls.
+    /// No current callsite uses this; the field is reserved for future use.
     pub redact_in_audit: Vec<usize>,
+    /// When `true`, the process will fork+detach (e.g. `openvpn --daemon`).
+    /// The runner takes two precautions:
+    ///
+    /// - stdout/stderr are routed to `Stdio::null()` instead of pipes, so
+    ///   the daemonized grandchild can't keep pipe write-ends alive after
+    ///   the parent exits.
+    /// - The runner uses `child.wait()` instead of `wait_with_output()`,
+    ///   returning as soon as the parent exits (typically right after the
+    ///   fork) — no waiting for pipe EOF.
+    ///
+    /// Without this flag, daemonizing subprocesses can hang
+    /// `wait_with_output` indefinitely because the inherited pipe never
+    /// EOFs. Callers using `daemonizes` are responsible for surfacing errors
+    /// via an alternate channel (e.g., the daemon's own `--log` file).
+    pub daemonizes: bool,
 }
 
 impl CommandSpec {
@@ -74,6 +88,7 @@ impl CommandSpec {
             requires_privilege: PrivilegeReq::None,
             kind: Kind::OneShot,
             redact_in_audit: Vec::new(),
+            daemonizes: false,
         }
     }
 
@@ -110,6 +125,17 @@ impl CommandSpec {
     #[must_use]
     pub fn redact_args(mut self, indices: impl IntoIterator<Item = usize>) -> Self {
         self.redact_in_audit = indices.into_iter().collect();
+        self
+    }
+
+    /// Builder: declare that this subprocess will fork+detach. Routes its
+    /// stdout/stderr to `/dev/null` and uses `child.wait()` instead of
+    /// `wait_with_output()`, so the runner returns as soon as the parent
+    /// exits — without blocking on pipe EOF from the daemonized grandchild.
+    /// See the `daemonizes` field doc for the full rationale.
+    #[must_use]
+    pub fn daemonizes(mut self) -> Self {
+        self.daemonizes = true;
         self
     }
 }
@@ -213,4 +239,36 @@ pub trait CommandRunner: Send + Sync {
         &self,
         spec: CommandSpec,
     ) -> impl std::future::Future<Output = Result<DetachedHandle, ProcessError>> + Send;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Default-constructed `oneshot` specs must not daemonize — that's
+    /// the opt-in flag for `openvpn --daemon` and similar fork+detach
+    /// subprocesses. Regression guard: an accidental flip would route
+    /// every subprocess to `Stdio::null()` and silently drop stderr.
+    #[test]
+    fn oneshot_does_not_daemonize_by_default() {
+        let spec = CommandSpec::oneshot("ls", vec!["-la".into()]);
+        assert!(!spec.daemonizes, "oneshot must default to non-daemonizing");
+    }
+
+    #[test]
+    fn detached_does_not_daemonize_by_default() {
+        let spec = CommandSpec::detached("ls", vec!["-la".into()]);
+        assert!(!spec.daemonizes, "detached spawn ≠ daemonize");
+    }
+
+    /// The `.daemonizes()` builder flips the flag. Honoured by
+    /// `RealRunner` to route stdio to `/dev/null` + use `child.wait()`
+    /// instead of `wait_with_output()` (see the field's docstring for
+    /// why this matters for `openvpn --daemon`).
+    #[test]
+    fn daemonizes_builder_sets_flag() {
+        // xtask:allow-protocol-leak: test fixture exercises the builder API; no subprocess spawned
+        let spec = CommandSpec::oneshot("openvpn", vec!["--daemon".into()]).daemonizes();
+        assert!(spec.daemonizes);
+    }
 }

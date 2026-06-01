@@ -76,13 +76,21 @@ EXIT CODES:
 pub enum Commands {
     /// Connect to a VPN profile
     ///
-    /// Connects to the specified profile, or reconnects to the last used profile
-    /// if no name is given. Blocks until the connection is established or times out.
+    /// Connects to the specified profile, or reconnects to the last used
+    /// profile if no name is given. Blocks until the connection is
+    /// established or times out.
+    ///
+    /// MULTI-TUNNEL CONFLICT GATE: connecting a profile that claims the
+    /// kernel default route while another tunnel already holds it (or
+    /// whose `AllowedIPs` overlap an active tunnel's routes) exits with
+    /// code 4 (`StateConflict`). Pass `--yes` to bypass for scripted /
+    /// non-interactive callers.
     ///
     /// EXAMPLES:
     ///     sudo vortix up work-vpn               Connect to 'work-vpn'
     ///     sudo vortix up work-vpn --json        Connect and get JSON result
     ///     sudo vortix up work-vpn --timeout 60  Connect with 60s timeout
+    ///     sudo vortix up vpn-b --yes            Bypass conflict gate (scripts)
     ///     sudo vortix up                        Reconnect to last used profile
     #[command(visible_alias = "connect")]
     Up {
@@ -93,41 +101,84 @@ pub enum Commands {
         /// Connection timeout in seconds
         #[arg(long, default_value = "20", value_name = "SECS")]
         timeout: u64,
+
+        /// Bypass the multi-tunnel conflict gate — default-route takeover
+        /// or route overlap (multi-connection plan U7). Without this flag,
+        /// conflicting connects exit with code 4 (`StateConflict`) so
+        /// scripted callers can branch.
+        #[arg(short, long)]
+        yes: bool,
     },
 
     /// Disconnect from VPN
     ///
-    /// Gracefully disconnects the active VPN connection. If already disconnected,
-    /// exits successfully (idempotent). Use --force to SIGKILL a stuck process.
+    /// Without arguments, disconnects every active tunnel (preserves
+    /// single-tunnel semantics — for one-tunnel users, "down" still
+    /// means "stop the one tunnel"). With a profile name, disconnects
+    /// that profile only. `--all` is the explicit script-friendly form
+    /// of the no-args behaviour. If already disconnected, exits
+    /// successfully (idempotent). Use --force to SIGKILL a stuck process.
     ///
     /// EXAMPLES:
-    ///     sudo vortix down              Graceful disconnect
+    ///     sudo vortix down              Disconnect every active tunnel
+    ///     sudo vortix down corp         Disconnect only the 'corp' profile
+    ///     sudo vortix down --all        Explicit "all" (script clarity)
     ///     sudo vortix down --force      Force-kill if stuck
     ///     sudo vortix down --json       Disconnect with JSON result
     #[command(visible_alias = "disconnect")]
     Down {
+        /// Profile to disconnect. Omit (or use --all) to disconnect every
+        /// active tunnel.
+        #[arg(value_hint = ValueHint::Other, conflicts_with = "all")]
+        profile: Option<String>,
+
+        /// Disconnect every active tunnel. Equivalent to omitting the
+        /// profile argument; the flag exists for script clarity.
+        #[arg(long)]
+        all: bool,
+
         /// Force-kill the VPN process (SIGKILL)
         #[arg(short, long)]
         force: bool,
     },
 
-    /// Reconnect to the last used VPN profile
+    /// Reconnect VPN tunnel(s)
     ///
-    /// Disconnects (if connected) and reconnects to the most recently used profile.
+    /// Without arguments, cycles every currently-Connected tunnel
+    /// (disconnect then reconnect) — matches today's single-tunnel
+    /// reconnect semantics applied across all active tunnels. With a
+    /// profile name, cycles that profile only.
     ///
     /// EXAMPLES:
-    ///     sudo vortix reconnect         Reconnect to last used profile
-    ///     sudo vortix reconnect --json  Reconnect with JSON result
-    Reconnect,
+    ///     sudo vortix reconnect            Cycle every active tunnel
+    ///     sudo vortix reconnect personal   Cycle only 'personal'
+    ///     sudo vortix reconnect --json     Reconnect with JSON result
+    Reconnect {
+        /// Profile to cycle. Omit to cycle every currently-Connected
+        /// tunnel.
+        #[arg(value_hint = ValueHint::Other)]
+        profile: Option<String>,
+    },
 
     /// Show connection state and network telemetry
     ///
     /// Displays the current VPN connection status, network statistics, and
     /// security posture. Use --watch for continuous monitoring.
     ///
+    /// JSON OUTPUT (v2 envelope, multi-tunnel aware):
+    ///     data.connections  array of every active tunnel (one entry
+    ///                       each for Connected / Connecting /
+    ///                       Disconnecting profiles)
+    ///     data.primary      profile name owning the kernel default
+    ///                       route, or null
+    ///     data.connection   back-compat single-tunnel object,
+    ///                       populated only when exactly one tunnel is
+    ///                       Connected (mirrors `data.connections[0]`);
+    ///                       null in any other case
+    ///
     /// EXAMPLES:
     ///     vortix status                          Human-readable status
-    ///     vortix status --json                   Full status as JSON
+    ///     vortix status --json                   Full v2 status envelope
     ///     vortix status --brief                  One-line summary
     ///     vortix status --watch                  Live updates every 2s
     ///     vortix status --watch --json           NDJSON stream for monitoring
@@ -143,6 +194,12 @@ pub enum Commands {
         /// One-line status summary
         #[arg(short, long)]
         brief: bool,
+
+        /// Always read state directly from disk + scanner, even if a
+        /// daemon socket is connectable. Useful for testing the
+        /// bypass path or working around a misbehaving daemon.
+        #[arg(long)]
+        no_daemon: bool,
     },
 
     /// List imported VPN profiles
@@ -198,11 +255,6 @@ pub enum Commands {
     ///     vortix show work-vpn                  Parsed config with masked secrets
     ///     vortix show work-vpn --raw            Raw `.conf`/`.ovpn` file contents
     ///     vortix show work-vpn --json           Parsed config as JSON
-    ///     vortix show work-vpn --raw            Raw config to stdout
-    ///     vortix show work-vpn --raw --inline-secrets   Raw config with
-    ///         stored credentials appended as a `# vortix-secret:<b64>` trailing
-    ///         comment (intended for sharing with a teammate who needs the
-    ///         credentials inline)
     Show {
         /// Profile name
         #[arg(value_hint = ValueHint::Other)]
@@ -211,12 +263,6 @@ pub enum Commands {
         /// Show raw config file contents
         #[arg(long)]
         raw: bool,
-
-        /// When combined with `--raw`, append SecretStore-backed
-        /// credentials as a trailing `# vortix-secret:<base64>` comment.
-        /// No-op when no stored secret matches the profile.
-        #[arg(long, requires = "raw")]
-        inline_secrets: bool,
     },
 
     /// Delete a VPN profile
@@ -254,18 +300,27 @@ pub enum Commands {
     /// Get or set the kill switch mode
     ///
     /// Without a mode argument, shows the current mode and state.
-    /// Modes: off (disabled), auto (arm on connect, block on drop),
-    /// always (block until VPN connects).
+    ///
+    /// Modes (same labels shown in the TUI and JSON envelope):
+    ///   off            — disabled; no firewall rules.
+    ///   block-on-drop  — armed while a VPN is up; engages default-DROP
+    ///                    egress only when the VPN drops unexpectedly.
+    ///                    Allows non-VPN traffic while disconnected.
+    ///   vpn-only       — firewall stays engaged whether VPN is up or
+    ///                    down. Default-DROP egress + ACCEPT rules for
+    ///                    active tunnels' interfaces + their server IPs.
+    ///                    The gap between a drop and reconnect can
+    ///                    never leak.
     ///
     /// EXAMPLES:
-    ///     vortix killswitch                     Show current mode
-    ///     sudo vortix killswitch auto           Set to auto
-    ///     sudo vortix killswitch always         Set to always-on
-    ///     sudo vortix killswitch off            Disable
-    ///     vortix killswitch --json              JSON with mode and state
+    ///     vortix killswitch                            Show current mode
+    ///     sudo vortix killswitch off                   Disable
+    ///     sudo vortix killswitch block-on-drop         Arm; block on unexpected drop
+    ///     sudo vortix killswitch vpn-only              Always engaged
+    ///     vortix killswitch --json                     JSON with mode and state
     #[command(name = "killswitch")]
     KillSwitch {
-        /// Target mode: off, auto, always (omit to show current)
+        /// Target mode: off, block-on-drop, vpn-only (omit to show current)
         mode: Option<String>,
     },
 
@@ -295,23 +350,6 @@ pub enum Commands {
     /// EXAMPLES:
     ///     vortix report
     Report,
-
-    /// Manage stored secrets (plan 006 U3)
-    ///
-    /// Lightweight wrapper over the `LayeredSecretStore` (OS keyring with
-    /// AES-256-GCM/argon2id encrypted-file fallback). Secrets stored
-    /// under `creds/<profile>` are consumed by `OvpnTunnel::up` at
-    /// connect time; profiles without a stored secret keep using the
-    /// legacy `auth/<profile>.auth` file path unchanged.
-    ///
-    /// EXAMPLES:
-    ///     echo -n 'my-password' | vortix secrets set creds/corp
-    ///     vortix secrets get creds/corp > /tmp/.creds      # restrict perms after
-    ///     vortix secrets delete creds/corp
-    Secrets {
-        #[command(subcommand)]
-        op: SecretsOp,
-    },
 
     /// Run the vortix daemon (plan 015 phase D / plan 010)
     ///
@@ -367,29 +405,149 @@ pub enum Commands {
     },
 }
 
-/// Subcommands for `vortix secrets`.
-#[derive(clap::Subcommand, Debug, Clone)]
-pub enum SecretsOp {
-    /// Store a secret. Reads the raw bytes from stdin.
-    Set {
-        /// Logical secret id (e.g. `creds/corp`).
-        id: String,
-    },
-    /// Print a stored secret to stdout (no trailing newline).
-    Get {
-        /// Logical secret id to retrieve.
-        id: String,
-        /// Backend hint (`keyring` or `encrypted-file`). Defaults to
-        /// whatever the layered store picks at runtime.
-        #[arg(long)]
-        backend: Option<String>,
-    },
-    /// Delete a stored secret.
-    Delete {
-        /// Logical secret id to remove.
-        id: String,
-        /// Backend hint (`keyring` or `encrypted-file`).
-        #[arg(long)]
-        backend: Option<String>,
-    },
+#[cfg(test)]
+mod tests {
+    //! Multi-connection plan U20: CLI grammar additions for the
+    //! down/reconnect/up subcommands. The runtime behaviour lives in
+    //! `commands.rs` and depends on root + live tunnels, so we test
+    //! only the clap parsing surface here — the contract that scripts
+    //! depend on is grammatical (positional vs flag positions, mutual
+    //! exclusion of `--all` with a positional, etc.).
+
+    use super::{Args, Commands};
+    use clap::Parser;
+
+    fn parse(argv: &[&str]) -> Args {
+        Args::try_parse_from(argv).unwrap_or_else(|e| panic!("parse failed for {argv:?}: {e}"))
+    }
+
+    fn parse_err(argv: &[&str]) -> clap::Error {
+        Args::try_parse_from(argv).expect_err("expected parse to fail")
+    }
+
+    #[test]
+    fn cli_down_no_args_means_all_active() {
+        let args = parse(&["vortix", "down"]);
+        match args.command {
+            Some(Commands::Down {
+                profile,
+                all,
+                force,
+            }) => {
+                assert!(profile.is_none());
+                assert!(!all);
+                assert!(!force);
+            }
+            other => panic!("expected Down, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_down_with_profile_positional() {
+        let args = parse(&["vortix", "down", "corp"]);
+        let Some(Commands::Down { profile, all, .. }) = args.command else {
+            panic!("expected Down");
+        };
+        assert_eq!(profile.as_deref(), Some("corp"));
+        assert!(!all);
+    }
+
+    #[test]
+    fn cli_down_all_flag_alone_parses() {
+        let args = parse(&["vortix", "down", "--all"]);
+        let Some(Commands::Down { profile, all, .. }) = args.command else {
+            panic!("expected Down");
+        };
+        assert!(profile.is_none());
+        assert!(all);
+    }
+
+    #[test]
+    fn cli_down_all_flag_conflicts_with_positional() {
+        // `--all` and a profile name are mutually exclusive — clap
+        // should reject the combination so scripts can't accidentally
+        // ask for both ("disconnect corp" + "disconnect all").
+        let err = parse_err(&["vortix", "down", "corp", "--all"]);
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn cli_down_keeps_force_flag() {
+        // SC8 single-tunnel scripts call `sudo vortix down --force` —
+        // make sure that grammar still parses.
+        let args = parse(&["vortix", "down", "--force"]);
+        let Some(Commands::Down {
+            profile,
+            all,
+            force,
+        }) = args.command
+        else {
+            panic!("expected Down");
+        };
+        assert!(profile.is_none());
+        assert!(!all);
+        assert!(force);
+    }
+
+    #[test]
+    fn cli_reconnect_no_args() {
+        let args = parse(&["vortix", "reconnect"]);
+        let Some(Commands::Reconnect { profile }) = args.command else {
+            panic!("expected Reconnect");
+        };
+        assert!(profile.is_none());
+    }
+
+    #[test]
+    fn cli_reconnect_with_profile() {
+        let args = parse(&["vortix", "reconnect", "personal"]);
+        let Some(Commands::Reconnect { profile }) = args.command else {
+            panic!("expected Reconnect");
+        };
+        assert_eq!(profile.as_deref(), Some("personal"));
+    }
+
+    #[test]
+    fn cli_up_accepts_yes_flag() {
+        let args = parse(&["vortix", "up", "corp", "--yes"]);
+        let Some(Commands::Up {
+            profile,
+            timeout,
+            yes,
+        }) = args.command
+        else {
+            panic!("expected Up");
+        };
+        assert_eq!(profile.as_deref(), Some("corp"));
+        assert_eq!(timeout, 20);
+        assert!(yes);
+    }
+
+    #[test]
+    fn cli_up_yes_short_flag() {
+        let args = parse(&["vortix", "up", "corp", "-y"]);
+        let Some(Commands::Up { yes, .. }) = args.command else {
+            panic!("expected Up");
+        };
+        assert!(yes);
+    }
+
+    #[test]
+    fn cli_up_without_yes_defaults_false() {
+        let args = parse(&["vortix", "up", "corp"]);
+        let Some(Commands::Up {
+            profile,
+            timeout,
+            yes,
+        }) = args.command
+        else {
+            panic!("expected Up");
+        };
+        assert_eq!(profile.as_deref(), Some("corp"));
+        assert_eq!(timeout, 20);
+        assert!(
+            !yes,
+            "yes must default to false to keep current scripts unaffected"
+        );
+    }
 }

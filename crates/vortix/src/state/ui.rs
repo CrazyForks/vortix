@@ -1,11 +1,13 @@
 //! UI state types.
 
 use super::Protocol;
+use crate::vortix_core::cidr::Cidr;
+use crate::vortix_core::profile::ProfileId;
 use std::time::{Duration, Instant};
 
 /// Duration for toast notifications to remain visible.
 pub const DISMISS_DURATION: Duration = Duration::from_secs(4);
-pub const HELP_OVERLAY_MAX_HEIGHT: u16 = 38;
+pub const HELP_OVERLAY_MAX_HEIGHT: u16 = 40;
 
 /// Currently focused UI panel for keyboard navigation.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Default)]
@@ -21,6 +23,62 @@ pub enum FocusedPanel {
     Security,
     /// Activity log panel (bottom right -> right).
     Logs,
+}
+
+/// Active tab in the Help overlay. `?` opens the overlay on
+/// [`HelpTab::Keys`] by default; `Tab` / `Shift+Tab` cycle through
+/// the tabs. Each tab renders its own content with an appropriate
+/// layout (compact two-column for Keys; card-style with multi-line
+/// prose for the glossary tabs).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum HelpTab {
+    /// Keybindings reference — `?`'s historic content.
+    #[default]
+    Keys,
+    /// Role label glossary for the Connection Details panel.
+    Roles,
+    /// Sigil reference for the Security Guard panel and sidebar.
+    Sigils,
+    /// Security Guard panel reference: what each row checks, what the
+    /// headline states (EXPOSED / PARTIAL / PROTECTED) mean, when to
+    /// worry vs ignore.
+    Guard,
+}
+
+impl HelpTab {
+    /// Tabs in cycle order — used by `Tab` / `Shift+Tab` navigation
+    /// in the Help overlay.
+    pub const ALL: &'static [HelpTab] = &[
+        HelpTab::Keys,
+        HelpTab::Roles,
+        HelpTab::Sigils,
+        HelpTab::Guard,
+    ];
+
+    /// Title shown in the tab strip at the top of the overlay.
+    #[must_use]
+    pub fn title(self) -> &'static str {
+        match self {
+            HelpTab::Keys => "Keys",
+            HelpTab::Roles => "Roles",
+            HelpTab::Sigils => "Sigils",
+            HelpTab::Guard => "Guard",
+        }
+    }
+
+    /// Next tab in [`HelpTab::ALL`] (wraps).
+    #[must_use]
+    pub fn next(self) -> HelpTab {
+        let idx = Self::ALL.iter().position(|t| *t == self).unwrap_or(0);
+        Self::ALL[(idx + 1) % Self::ALL.len()]
+    }
+
+    /// Previous tab in [`HelpTab::ALL`] (wraps).
+    #[must_use]
+    pub fn prev(self) -> HelpTab {
+        let idx = Self::ALL.iter().position(|t| *t == self).unwrap_or(0);
+        Self::ALL[(idx + Self::ALL.len() - 1) % Self::ALL.len()]
+    }
 }
 
 /// Which field is focused in the auth credentials overlay.
@@ -68,10 +126,16 @@ pub enum InputMode {
         /// Is "Yes" selected?
         confirm_selected: bool,
     },
-    /// Help overlay showing all keybindings.
+    /// Help overlay showing all keybindings + glossaries.
     Help {
-        /// Vertical scroll offset.
+        /// Vertical scroll offset within the active tab. Reset to 0
+        /// on tab switch — no per-tab scroll memory (simplifies the
+        /// state and matches user expectation of "switching gives a
+        /// fresh page").
         scroll: u16,
+        /// Currently active tab. `?` opens on [`HelpTab::Keys`];
+        /// `Tab` / `Shift+Tab` cycle.
+        tab: HelpTab,
     },
     /// Profile rename dialog.
     Rename {
@@ -89,11 +153,44 @@ pub enum InputMode {
         /// Cursor position in the query.
         cursor: usize,
     },
-    /// Confirmation dialog for switching VPN profile while connected.
-    ConfirmSwitch {
+    /// Confirmation dialog when connecting a new profile would take over the
+    /// default route from an already-active tunnel (multi-connection plan #001
+    /// U7 — formerly `ConfirmSwitch`). On confirm the connect path retries
+    /// with `force=true`, inverting the primary.
+    ConfirmDefaultRouteTakeover {
+        /// Name of the profile currently holding the default route (display only).
         from: String,
-        to_idx: usize,
+        /// Profile id of the new tunnel attempting the takeover.
+        to_profile_id: ProfileId,
+        /// Display name of the new tunnel.
         to_name: String,
+        /// "Yes" button currently selected?
+        confirm_selected: bool,
+    },
+    /// Confirmation dialog when a new profile's `AllowedIPs` overlap with an
+    /// already-active tunnel's `AllowedIPs` on a non-default-route CIDR (R10).
+    /// On confirm the connect path retries with `force=true`.
+    ConfirmRouteOverlap {
+        /// Profile id of the conflicting (already-active) tunnel.
+        with_profile_id: ProfileId,
+        /// The overlapping CIDRs reported by the registry's conflict detector.
+        overlapping_cidrs: Vec<Cidr>,
+        /// Profile id of the new tunnel attempting to connect.
+        to_profile_id: ProfileId,
+        /// Display name of the new tunnel.
+        to_name: String,
+        /// "Yes" button currently selected?
+        confirm_selected: bool,
+    },
+    /// Confirmation dialog for "Disconnect all N tunnels?" (multi-connection
+    /// plan #001 U19). Fired by Shift+`D` from the sidebar when more than one
+    /// active tunnel exists; with N≤1 the shortcut acts identically to plain
+    /// `d` and this overlay is skipped (backwards-compatible single-tunnel
+    /// behavior).
+    ConfirmDisconnectAll {
+        /// Number of currently active tunnels (for display).
+        count: usize,
+        /// "Yes" button currently selected?
         confirm_selected: bool,
     },
     /// `OpenVPN` authentication credentials dialog.
@@ -119,6 +216,11 @@ pub enum InputMode {
     },
 }
 
+/// Number of rows the tabbed help-overlay's chrome eats from the
+/// inner area (tab strip + divider). The actual content paragraph
+/// gets `inner_height - HELP_OVERLAY_CHROME_ROWS`.
+pub const HELP_OVERLAY_CHROME_ROWS: u16 = 3;
+
 #[must_use]
 pub fn help_max_scroll_for_terminal_height(terminal_height: u16, total_lines: u16) -> u16 {
     if terminal_height == 0 {
@@ -128,8 +230,13 @@ pub fn help_max_scroll_for_terminal_height(terminal_height: u16, total_lines: u1
     let overlay_height = terminal_height
         .saturating_sub(2)
         .min(HELP_OVERLAY_MAX_HEIGHT);
+    // Subtract 2 for the Block border (top+bottom), then 3 more for
+    // the tab strip + divider that `render` inserts at the top of the
+    // inner area. Without the chrome subtraction, the bottom 3 lines
+    // of each tab would be unreachable via scroll.
     let inner_height = overlay_height.saturating_sub(2);
-    total_lines.saturating_sub(inner_height)
+    let content_height = inner_height.saturating_sub(HELP_OVERLAY_CHROME_ROWS);
+    total_lines.saturating_sub(content_height)
 }
 
 /// State for the panel flip animation.

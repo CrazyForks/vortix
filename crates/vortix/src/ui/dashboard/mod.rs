@@ -116,6 +116,10 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 
     render_overlays(frame, app);
 
+    // Auto-promote notification surfaces as a top-right toast (set in
+    // `detect_primary_change_for_banner`). No central banner widget,
+    // no [u] revert hotkey — the user decides what action to take.
+
     // Render Zoomed Panel Overlay (if active)
     if let Some(panel) = &app.zoomed_panel {
         let zoom_area = centered_rect(90, 90, frame.area());
@@ -256,38 +260,185 @@ fn render_overlays(frame: &mut Frame, app: &mut App) {
         InputMode::Rename {
             new_name, cursor, ..
         } => super::overlays::rename::render(frame, new_name, *cursor),
-        InputMode::Help { scroll } => super::overlays::help::render(frame, *scroll),
+        InputMode::Help { scroll, tab } => super::overlays::help::render(frame, *scroll, *tab),
         InputMode::Search { query, cursor } => {
-            super::overlays::search::render(frame, app, query, *cursor, app.engine.profiles.len());
+            super::overlays::search::render(frame, app, query, *cursor, app.runtime.profiles.len());
         }
-        InputMode::ConfirmSwitch {
+        InputMode::ConfirmDefaultRouteTakeover {
             from,
             to_name,
             confirm_selected,
             ..
         } => {
-            let max = 28;
-            let from_t = utils::truncate(from, max);
-            let to_t = utils::truncate(to_name, max);
+            // Multi-connect is a NEW feature (plan 001) — most users
+            // running into this overlay want the familiar pre-existing
+            // "switch VPN" behavior (disconnect old, connect new). So
+            // [Y]/Enter is wired to Switch (the recommended/default
+            // action) and the new Connect-both path is gated behind
+            // an opt-in [B] hotkey. Y/N nav still works as expected;
+            // the cursor defaults to [Y]es.
+            //
+            // The popup fires when both VPNs declare a default route
+            // (0.0.0.0/0) — only one can actually hold the kernel
+            // default route at a time. Either flavor of resolution
+            // (Switch or Both) acknowledges that constraint; Both
+            // keeps the demoted VPN connected as a split tunnel for
+            // failover or per-subnet routing.
+            let max = 22;
+            let from_t1 = utils::truncate(from, max);
+            let from_t2 = utils::truncate(from, max);
+            let to_t1 = utils::truncate(to_name, max);
+            let to_t2 = utils::truncate(to_name, max);
+            let to_t3 = utils::truncate(to_name, max);
             confirm_dialog::render(
                 frame,
                 ConfirmDialogConfig {
-                    title: " Switch Profile ",
+                    title: " Already connected ",
                     body: vec![
                         Line::from(vec![
+                            Span::styled(to_t1, Style::default().fg(theme::SUCCESS)),
                             Span::styled(
-                                "Disconnect from ",
+                                " also wants to handle all",
                                 Style::default().fg(theme::TEXT_SECONDARY),
                             ),
-                            Span::styled(from_t, Style::default().fg(theme::ACCENT_PRIMARY)),
+                        ]),
+                        Line::from(vec![Span::styled(
+                            "your internet traffic.",
+                            Style::default().fg(theme::TEXT_SECONDARY),
+                        )]),
+                        Line::from(""),
+                        Line::from(vec![
+                            Span::styled(
+                                "[Y] Switch ",
+                                Style::default()
+                                    .fg(theme::SUCCESS)
+                                    .add_modifier(ratatui::style::Modifier::BOLD),
+                            ),
+                            Span::styled(
+                                "— disconnect ",
+                                Style::default().fg(theme::TEXT_SECONDARY),
+                            ),
+                            Span::styled(from_t1, Style::default().fg(theme::ACCENT_PRIMARY)),
+                            Span::styled(
+                                ", then connect ",
+                                Style::default().fg(theme::TEXT_SECONDARY),
+                            ),
+                            Span::styled(to_t2, Style::default().fg(theme::SUCCESS)),
                         ]),
                         Line::from(vec![
                             Span::styled(
-                                "and connect to ",
+                                "[B] Connect both ",
+                                Style::default()
+                                    .fg(theme::ACCENT_PRIMARY)
+                                    .add_modifier(ratatui::style::Modifier::BOLD),
+                            ),
+                            Span::styled("— ", Style::default().fg(theme::TEXT_SECONDARY)),
+                            Span::styled(to_t3, Style::default().fg(theme::SUCCESS)),
+                            Span::styled(
+                                " becomes active;",
                                 Style::default().fg(theme::TEXT_SECONDARY),
                             ),
+                        ]),
+                        Line::from(vec![
+                            Span::styled("    ", Style::default()),
+                            Span::styled(from_t2, Style::default().fg(theme::ACCENT_PRIMARY)),
+                            Span::styled(
+                                " stays connected as split tunnel",
+                                Style::default().fg(theme::TEXT_SECONDARY),
+                            ),
+                        ]),
+                        Line::from(vec![Span::styled(
+                            "[N] Cancel",
+                            Style::default()
+                                .fg(theme::TEXT_SECONDARY)
+                                .add_modifier(ratatui::style::Modifier::BOLD),
+                        )]),
+                    ],
+                    border_color: theme::WARNING,
+                    confirm_selected: *confirm_selected,
+                    width: 64,
+                    height: 12,
+                },
+            );
+        }
+        InputMode::ConfirmRouteOverlap {
+            with_profile_id,
+            overlapping_cidrs,
+            to_name,
+            confirm_selected,
+            ..
+        } => {
+            let max = 28;
+            let with_t = utils::truncate(with_profile_id.as_str(), max);
+            let to_t = utils::truncate(to_name, max);
+            // Display up to two overlapping CIDRs inline; the rest collapse
+            // into a "+N more" tail so a wide AllowedIPs set doesn't blow
+            // the dialog height.
+            let cidr_summary = if overlapping_cidrs.is_empty() {
+                String::from("(unknown)")
+            } else {
+                let mut parts: Vec<String> = overlapping_cidrs
+                    .iter()
+                    .take(2)
+                    .map(|c| format!("{}/{}", c.addr, c.prefix_len))
+                    .collect();
+                if overlapping_cidrs.len() > 2 {
+                    parts.push(format!("+{} more", overlapping_cidrs.len() - 2));
+                }
+                parts.join(", ")
+            };
+            confirm_dialog::render(
+                frame,
+                ConfirmDialogConfig {
+                    title: " Route Overlap ",
+                    body: vec![
+                        Line::from(vec![
+                            Span::styled("Connect ", Style::default().fg(theme::TEXT_SECONDARY)),
                             Span::styled(to_t, Style::default().fg(theme::SUCCESS)),
+                            Span::styled(
+                                " — overlaps with ",
+                                Style::default().fg(theme::TEXT_SECONDARY),
+                            ),
+                            Span::styled(with_t, Style::default().fg(theme::ACCENT_PRIMARY)),
+                        ]),
+                        Line::from(vec![
+                            Span::styled("on ", Style::default().fg(theme::TEXT_SECONDARY)),
+                            Span::styled(cidr_summary, Style::default().fg(theme::WARNING)),
                             Span::styled("?", Style::default().fg(theme::TEXT_SECONDARY)),
+                        ]),
+                    ],
+                    border_color: theme::WARNING,
+                    confirm_selected: *confirm_selected,
+                    width: 56,
+                    height: 7,
+                },
+            );
+        }
+        InputMode::ConfirmDisconnectAll {
+            count,
+            confirm_selected,
+        } => {
+            // Multi-connection plan #001 U19: Shift+D from the sidebar
+            // with N>1 active tunnels opens this confirm dialog before
+            // tearing them all down.
+            confirm_dialog::render(
+                frame,
+                ConfirmDialogConfig {
+                    title: " Disconnect All ",
+                    body: vec![
+                        Line::from(""),
+                        Line::from(vec![
+                            Span::styled(
+                                "Disconnect all ",
+                                Style::default().fg(theme::TEXT_SECONDARY),
+                            ),
+                            Span::styled(
+                                count.to_string(),
+                                Style::default()
+                                    .fg(theme::WARNING)
+                                    .add_modifier(Modifier::BOLD),
+                            ),
+                            Span::styled(" tunnels?", Style::default().fg(theme::TEXT_SECONDARY)),
                         ]),
                     ],
                     border_color: theme::WARNING,

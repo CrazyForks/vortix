@@ -145,6 +145,73 @@ pub fn get_profiles_dir() -> std::io::Result<std::path::PathBuf> {
     Ok(path)
 }
 
+/// Returns the per-session temp config directory `${config_dir}/tmp/${session_id}/`.
+///
+/// Both the `tmp/` parent and the per-session subdir are forced to mode
+/// `0o700` — the default umask would yield `0o755`, allowing any local
+/// process to enumerate active session IDs by listing the parent. Used by
+/// `WireGuard` secondary connect-time DNS scoping (plan #009 U13): the
+/// secondary's rewritten `.conf` (with `DNS =` stripped) is written under
+/// this subdir so crashed disconnects leave isolated orphans that the
+/// startup sweep cleans by session-liveness check (subdir name ≠ current
+/// `session_id`).
+///
+/// The subdir name matches the journal's `session_id` (`{ISO}-{pid}`), so a
+/// new vortix process is guaranteed a fresh subdir name; the prior session's
+/// subdir is unambiguously an orphan regardless of age.
+///
+/// # Errors
+///
+/// Returns an error if the config directory cannot be resolved or if the
+/// per-session subdirectory cannot be created at the required mode.
+#[cfg(unix)]
+pub fn get_tmp_config_dir(session_id: &str) -> std::io::Result<std::path::PathBuf> {
+    use std::os::unix::fs::DirBuilderExt;
+
+    let root = get_app_config_dir()?;
+    let tmp_root = root.join(crate::constants::TMP_CONFIG_DIR);
+
+    // Create `tmp/` and the per-session subdir at 0o700 explicitly.
+    // `recursive(true)` is idempotent on existing dirs but does NOT re-chmod
+    // them, so on first creation we set the mode through DirBuilder; on
+    // existing dirs we leave the mode alone (the only writer is this
+    // process's prior call, which used the same mode).
+    if !tmp_root.exists() {
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .recursive(true)
+            .create(&tmp_root)?;
+        crate::config::fix_ownership(&tmp_root);
+    }
+
+    let session_dir = tmp_root.join(session_id);
+    if !session_dir.exists() {
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .recursive(true)
+            .create(&session_dir)?;
+        crate::config::fix_ownership(&session_dir);
+    }
+
+    Ok(session_dir)
+}
+
+/// Non-Unix fallback: no `chmod`, just `create_dir_all` via `create_user_dir`.
+///
+/// # Errors
+///
+/// Returns an error if the config directory cannot be resolved or directory
+/// creation fails.
+#[cfg(not(unix))]
+pub fn get_tmp_config_dir(session_id: &str) -> std::io::Result<std::path::PathBuf> {
+    let root = get_app_config_dir()?;
+    let session_dir = root.join(crate::constants::TMP_CONFIG_DIR).join(session_id);
+    if !session_dir.exists() {
+        create_user_dir(&session_dir)?;
+    }
+    Ok(session_dir)
+}
+
 /// Returns the `OpenVPN` runtime directory path for a given profile.
 ///
 /// Creates `~/.config/vortix/run/` if it doesn't exist.
@@ -223,25 +290,39 @@ pub fn get_openvpn_auth_path(profile_name: &str) -> std::io::Result<std::path::P
 
 /// Writes `OpenVPN` credentials to a file (username on line 1, password on line 2).
 ///
-/// The file is created with `chmod 600` (owner read/write only).
+/// The file is created with `chmod 600` (owner read/write only) in a single
+/// step via [`crate::vortix_core::secret_file::write_secret_file`], which
+/// uses `openat(2)` against a held parent-directory fd to close the
+/// parent-directory TOCTOU window. If the auth file already exists from a
+/// previous run, it is removed first so the credential rewrite succeeds.
 ///
 /// # Errors
 ///
-/// Returns an error if file write or permission setting fails.
+/// Returns an error if file write fails.
 #[cfg(unix)]
 pub fn write_openvpn_auth_file(
     profile_name: &str,
     username: &str,
     password: &str,
 ) -> std::io::Result<std::path::PathBuf> {
-    use std::os::unix::fs::PermissionsExt;
+    use crate::vortix_core::secret_file::{write_secret_file, SecretFileError};
 
     let auth_path = get_openvpn_auth_path(profile_name)?;
-    write_user_file(&auth_path, format!("{username}\n{password}\n"))?;
 
-    let mut perms = std::fs::metadata(&auth_path)?.permissions();
-    perms.set_mode(0o600);
-    std::fs::set_permissions(&auth_path, perms)?;
+    // The credential-safe helper refuses to overwrite. Remove any stale
+    // file from a prior run so a credential rotation still lands. Ignore
+    // NotFound — the file simply doesn't exist yet on first use.
+    match std::fs::remove_file(&auth_path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+
+    let body = format!("{username}\n{password}\n");
+    write_secret_file(&auth_path, body.as_bytes()).map_err(|e| match e {
+        SecretFileError::Io(io) => io,
+        other => std::io::Error::other(other.to_string()),
+    })?;
 
     Ok(auth_path)
 }
@@ -576,10 +657,83 @@ pub fn get_unique_path(dir: &std::path::Path, filename: &str) -> std::path::Path
     path
 }
 
+/// Check whether a named executable exists somewhere on `PATH`.
+///
+/// Walks `$PATH` entries directly via `std::env::split_paths` and checks
+/// each for the binary — does NOT shell out to `which`. The earlier
+/// `which`-based implementation broke on Fedora minimal containers
+/// (and any other distro where the `which` binary itself is in a
+/// separate package), where it would falsely report system-installed
+/// binaries as missing. Catching this was the first regression the
+/// matrixed Fedora integration test surfaced.
+///
+/// On Unix, also requires the file to have an executable bit set; on
+/// other platforms, presence as a regular file is sufficient.
 pub(crate) fn binary_exists(name: &str) -> bool {
-    use crate::vortix_process::CommandSpec;
-    crate::vortix_process::run_to_output(CommandSpec::oneshot("which", vec![name.to_string()]))
-        .is_ok_and(|o| o.status.success())
+    use std::env;
+
+    let Ok(path) = env::var("PATH") else {
+        return false;
+    };
+
+    for dir in env::split_paths(&path) {
+        let candidate = dir.join(name);
+        if !candidate.is_file() {
+            continue;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(meta) = candidate.metadata() {
+                if meta.permissions().mode() & 0o111 != 0 {
+                    return true;
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Locate a named executable on `$PATH` and return the first matching path.
+///
+/// Same PATH-walking + exec-bit check as [`binary_exists`], but returns
+/// the actual path (`Some(PathBuf)`) instead of `bool`. Used by diagnostic
+/// output (`vortix doctor` / `vortix info`) that needs to print where a
+/// tool is installed.
+///
+/// Plan 002 U1: replaces the residual `cmd_stdout("which", ...)` shell-outs
+/// in `cli/report.rs` so vortix doesn't break on minimal-install systems
+/// where `which` itself isn't in the default package set (e.g. Fedora
+/// minimal containers).
+pub(crate) fn find_binary_path(name: &str) -> Option<std::path::PathBuf> {
+    use std::env;
+
+    let path = env::var("PATH").ok()?;
+
+    for dir in env::split_paths(&path) {
+        let candidate = dir.join(name);
+        if !candidate.is_file() {
+            continue;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(meta) = candidate.metadata() {
+                if meta.permissions().mode() & 0o111 != 0 {
+                    return Some(candidate);
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 /// Check whether `resolvconf` is installed and functional.
@@ -591,15 +745,26 @@ pub(crate) fn binary_exists(name: &str) -> bool {
 #[cfg(target_os = "linux")] // xtask:allow-platform-cfg: resolvconf-shim probing is Linux-only DNS plumbing
 pub(crate) fn resolvconf_works() -> bool {
     use crate::vortix_process::CommandSpec;
+    use std::time::Duration;
     if !binary_exists("resolvconf") {
         return false;
     }
     // Test with `--version` which works with both openresolv and systemd-resolvconf.
     // `resolvconf -l` (list) is not supported by systemd-resolvconf's shim.
-    crate::vortix_process::run_to_output(CommandSpec::oneshot(
-        "resolvconf",
-        vec!["--version".into()],
-    ))
+    //
+    // The 10s cap mirrors the openvpn version-probe defense in
+    // `vpn_runtime/openvpn.rs`: this probe is called from
+    // `check_dependencies` on the UI thread during a connect press,
+    // so a hung subprocess (broken DNS plumbing, locked /etc/resolv.conf,
+    // an openresolv shim stuck on a syscall) would freeze the TUI until
+    // the user kills it. 10s is generous for any healthy probe; on
+    // timeout we return `false`, which routes the user to the existing
+    // "resolvconf not available" error path — strictly better than a
+    // wedged panel.
+    crate::vortix_process::run_to_output(
+        CommandSpec::oneshot("resolvconf", vec!["--version".into()])
+            .timeout(Duration::from_secs(10)),
+    )
     .is_ok_and(|o| o.status.success())
 }
 
@@ -647,6 +812,77 @@ pub(crate) fn wireguard_config_has_dns(config_path: &std::path::Path) -> bool {
 mod tests {
     use super::*;
     use std::time::{Duration, SystemTime};
+
+    // ───── binary_exists ─────────────────────────────────────────────────
+
+    #[test]
+    fn binary_exists_finds_a_known_present_unix_binary() {
+        // `sh` is part of POSIX and present on every Unix CI runner we
+        // support (macOS, Ubuntu, Fedora). On Windows the test simply
+        // asserts the function doesn't panic — non-Unix runners don't
+        // have a guaranteed binary at a known PATH location.
+        #[cfg(unix)]
+        assert!(
+            binary_exists("sh"),
+            "binary_exists should locate `sh` on Unix-like PATH"
+        );
+        #[cfg(not(unix))]
+        let _ = binary_exists("sh");
+    }
+
+    #[test]
+    fn binary_exists_returns_false_for_known_absent_binary() {
+        // Pick a name that almost certainly won't exist on any runner.
+        // If this ever flakes, the runner has a binary called
+        // `vortix-nonexistent-xyz123` and we have bigger problems.
+        assert!(!binary_exists("vortix-nonexistent-xyz123"));
+    }
+
+    // NOTE: Earlier draft had an "empty PATH" test that mutated
+    // env::PATH and restored it. Dropped because:
+    //   1. env::set_var / env::remove_var are unsafe in modern Rust
+    //      (process-wide global state; not thread-safe under cargo
+    //      test's parallel runner).
+    //   2. The function's behavior on PATH=unset is trivially
+    //      `false` via the `let Ok(path) = env::var("PATH") else`
+    //      guard — covered by inspection, not worth a racy test.
+
+    // ───── find_binary_path (plan 002 U1) ─────────────────────────────────
+
+    #[test]
+    fn find_binary_path_returns_existing_path_for_known_unix_binary() {
+        #[cfg(unix)]
+        {
+            let path =
+                find_binary_path("sh").expect("`sh` should be locatable on every Unix CI runner");
+            assert!(path.is_file(), "returned path must exist on disk: {path:?}");
+            assert!(
+                path.ends_with("sh"),
+                "returned path's filename should be `sh`: {path:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn find_binary_path_returns_none_for_known_absent_binary() {
+        assert!(find_binary_path("vortix-nonexistent-xyz123").is_none());
+    }
+
+    #[test]
+    fn find_binary_path_and_binary_exists_agree() {
+        // Invariant: `binary_exists(x)` must equal `find_binary_path(x).is_some()`
+        // for every input. The two functions share PATH-walking logic; they
+        // should never disagree.
+        for name in ["sh", "vortix-nonexistent-xyz123", "cat", "another-fake"] {
+            assert_eq!(
+                binary_exists(name),
+                find_binary_path(name).is_some(),
+                "binary_exists and find_binary_path disagree on `{name}`"
+            );
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
 
     #[test]
     fn test_format_bytes_speed_bytes() {
@@ -1059,5 +1295,42 @@ mod tests {
         )
         .unwrap();
         assert!(!wireguard_config_has_dns(&path));
+    }
+
+    // --- get_tmp_config_dir (U13) ---
+
+    #[cfg(unix)]
+    #[test]
+    fn test_get_tmp_config_dir_creates_session_subdir_at_0700() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // `set_temp_config_dir` writes via `set_config_dir`'s `OnceLock` —
+        // first writer wins across the whole test binary. Sibling tests are
+        // unaffected because each test passes a unique session_id; subdirs
+        // therefore can't collide even when they share a `tmp/` root.
+        let _tmp = set_temp_config_dir();
+        let sid = format!("session-{}-{}", std::process::id(), line!());
+        let session_dir = get_tmp_config_dir(&sid).unwrap();
+        assert!(session_dir.ends_with(format!("tmp/{sid}")));
+
+        let leaf_perms = std::fs::metadata(&session_dir).unwrap().permissions();
+        assert_eq!(leaf_perms.mode() & 0o777, 0o700);
+
+        // `tmp/` root is tightened to 0o700 — default umask would produce
+        // 0o755 and leak session IDs via readdir.
+        let tmp_root = session_dir.parent().unwrap();
+        let root_perms = std::fs::metadata(tmp_root).unwrap().permissions();
+        assert_eq!(root_perms.mode() & 0o777, 0o700);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_get_tmp_config_dir_is_idempotent() {
+        let _tmp = set_temp_config_dir();
+        let sid = format!("idempotent-{}-{}", std::process::id(), line!());
+        let a = get_tmp_config_dir(&sid).unwrap();
+        let b = get_tmp_config_dir(&sid).unwrap();
+        assert_eq!(a, b);
+        assert!(a.exists());
     }
 }

@@ -1,31 +1,32 @@
 //! CLI integration tests.
 //!
-//! These tests verify the CLI output layer, `VpnEngine` headless mode, and
+//! These tests verify the CLI output layer, `VpnRuntime` headless mode, and
 //! command handlers without requiring root, VPN tools, or network access.
 
 use vortix::cli::output::{error_response, CliError, CliResponse, ExitCode, OutputMode};
-use vortix::engine::VpnEngine;
-use vortix::state::{ConnectionState, KillSwitchMode, KillSwitchState, Protocol, VpnProfile};
+use vortix::state::{KillSwitchMode, KillSwitchState, Protocol, VpnProfile};
+use vortix::vpn_runtime::VpnRuntime;
 
 // ============================================================================
-// VpnEngine headless mode
+// VpnRuntime headless mode
 // ============================================================================
 
 #[test]
 fn engine_new_headless_starts_disconnected() {
+    // P5d: the legacy `connection_state` field was retired; a fresh
+    // headless engine carries no active tunnels — verified via the
+    // scanner-driven `scan_status` snapshot below.
     let config = vortix::config::AppConfig::default();
     let dir = tempfile::tempdir().unwrap();
-    let engine = VpnEngine::new_headless(config, dir.path().to_path_buf());
-    assert!(matches!(
-        engine.connection_state,
-        ConnectionState::Disconnected
-    ));
+    let engine = VpnRuntime::new_headless(config, dir.path().to_path_buf());
     assert!(!engine.is_root); // tests run unprivileged
+    let snap = engine.scan_status();
+    assert_eq!(snap.connection_state, "disconnected");
 }
 
 #[test]
 fn engine_new_test_has_empty_profiles() {
-    let engine = VpnEngine::new_test();
+    let engine = VpnRuntime::new_test();
     assert!(engine.profiles.is_empty());
     assert!(engine.session_start.is_none());
     assert_eq!(engine.killswitch_mode, KillSwitchMode::Off);
@@ -34,7 +35,7 @@ fn engine_new_test_has_empty_profiles() {
 
 #[test]
 fn engine_find_profile_by_name() {
-    let mut engine = VpnEngine::new_test();
+    let mut engine = VpnRuntime::new_test();
     engine.profiles.push(VpnProfile {
         name: "work-vpn".into(),
         protocol: Protocol::WireGuard,
@@ -57,7 +58,7 @@ fn engine_find_profile_by_name() {
 
 #[test]
 fn engine_sort_profiles_by_name() {
-    let mut engine = VpnEngine::new_test();
+    let mut engine = VpnRuntime::new_test();
     for name in &["charlie", "alpha", "bravo"] {
         engine.profiles.push(VpnProfile {
             name: (*name).into(),
@@ -81,7 +82,7 @@ fn engine_sort_profiles_by_name() {
 
 #[test]
 fn engine_sort_profiles_by_protocol() {
-    let mut engine = VpnEngine::new_test();
+    let mut engine = VpnRuntime::new_test();
     engine.profiles.push(VpnProfile {
         name: "ovpn-profile".into(),
         protocol: Protocol::OpenVPN,
@@ -107,14 +108,14 @@ fn engine_sort_profiles_by_protocol() {
 fn engine_check_dependencies_wireguard() {
     // Use a dummy config path — the resolvconf check only matters on Linux
     let dummy = std::path::Path::new("/dev/null");
-    let missing = VpnEngine::check_dependencies(Protocol::WireGuard, dummy);
+    let missing = VpnRuntime::check_dependencies(Protocol::WireGuard, dummy);
     // In test env, wg-quick/wg may or may not be available; just ensure no panic
     assert!(missing.len() <= 3); // wg-quick, wg, and possibly resolvconf on Linux
 }
 
 #[test]
 fn engine_scan_status_when_disconnected() {
-    let engine = VpnEngine::new_test();
+    let engine = VpnRuntime::new_test();
     let snap = engine.scan_status();
     assert_eq!(snap.connection_state, "disconnected");
     assert!(snap.profile.is_none());
@@ -251,6 +252,7 @@ fn cli_status_disconnected() {
             watch: false,
             interval: 2,
             brief: true,
+            no_daemon: true,
         },
         dir.path(),
         "test",
@@ -491,4 +493,134 @@ fn clap_global_flags_propagate() {
     assert!(args.json);
     assert!(args.quiet);
     assert!(args.verbose);
+}
+
+// ============================================================================
+// Multi-tunnel CLI grammar (plan 001 U20 — Down with profile/--all, Reconnect
+// with profile, Up --yes flag). Plan 002 U6-narrow.
+// ============================================================================
+
+#[test]
+fn clap_parses_down_with_profile_arg() {
+    use clap::Parser;
+    use vortix::cli::args::{Args, Commands};
+
+    let args = Args::try_parse_from(["vortix", "down", "corp"]).unwrap();
+    if let Some(Commands::Down {
+        profile,
+        all,
+        force,
+    }) = args.command
+    {
+        assert_eq!(profile.as_deref(), Some("corp"));
+        assert!(!all);
+        assert!(!force);
+    } else {
+        panic!("Expected Down command with profile");
+    }
+}
+
+#[test]
+fn clap_parses_down_all_flag() {
+    use clap::Parser;
+    use vortix::cli::args::{Args, Commands};
+
+    let args = Args::try_parse_from(["vortix", "down", "--all"]).unwrap();
+    if let Some(Commands::Down {
+        profile,
+        all,
+        force,
+    }) = args.command
+    {
+        assert!(profile.is_none());
+        assert!(all);
+        assert!(!force);
+    } else {
+        panic!("Expected Down command with --all");
+    }
+}
+
+#[test]
+fn clap_rejects_down_profile_with_all_flag() {
+    use clap::Parser;
+    use vortix::cli::args::Args;
+
+    // `profile` is `conflicts_with = "all"`; clap must reject the combination.
+    let result = Args::try_parse_from(["vortix", "down", "corp", "--all"]);
+    assert!(
+        result.is_err(),
+        "down corp --all should be rejected by clap conflicts_with"
+    );
+    let err = result.unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("cannot be used with") || msg.contains("conflict"),
+        "expected conflicts_with error, got: {msg}"
+    );
+}
+
+#[test]
+fn clap_parses_reconnect_with_profile_arg() {
+    use clap::Parser;
+    use vortix::cli::args::{Args, Commands};
+
+    let args = Args::try_parse_from(["vortix", "reconnect", "personal"]).unwrap();
+    if let Some(Commands::Reconnect { profile }) = args.command {
+        assert_eq!(profile.as_deref(), Some("personal"));
+    } else {
+        panic!("Expected Reconnect command with profile");
+    }
+}
+
+#[test]
+fn clap_parses_reconnect_no_args() {
+    use clap::Parser;
+    use vortix::cli::args::{Args, Commands};
+
+    let args = Args::try_parse_from(["vortix", "reconnect"]).unwrap();
+    if let Some(Commands::Reconnect { profile }) = args.command {
+        assert!(profile.is_none());
+    } else {
+        panic!("Expected Reconnect command");
+    }
+}
+
+#[test]
+fn clap_parses_up_yes_long_flag() {
+    use clap::Parser;
+    use vortix::cli::args::{Args, Commands};
+
+    let args = Args::try_parse_from(["vortix", "up", "corp", "--yes"]).unwrap();
+    if let Some(Commands::Up { profile, yes, .. }) = args.command {
+        assert_eq!(profile.as_deref(), Some("corp"));
+        assert!(yes);
+    } else {
+        panic!("Expected Up command with --yes");
+    }
+}
+
+#[test]
+fn clap_parses_up_yes_short_flag() {
+    use clap::Parser;
+    use vortix::cli::args::{Args, Commands};
+
+    let args = Args::try_parse_from(["vortix", "up", "corp", "-y"]).unwrap();
+    if let Some(Commands::Up { yes, .. }) = args.command {
+        assert!(yes, "-y short flag should set yes=true");
+    } else {
+        panic!("Expected Up command");
+    }
+}
+
+#[test]
+fn clap_parses_up_yes_defaults_false() {
+    use clap::Parser;
+    use vortix::cli::args::{Args, Commands};
+
+    let args = Args::try_parse_from(["vortix", "up", "corp"]).unwrap();
+    if let Some(Commands::Up { yes, .. }) = args.command {
+        assert!(!yes, "yes should default to false when --yes/-y absent");
+    } else {
+        panic!("Expected Up command");
+    }
 }

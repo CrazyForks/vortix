@@ -87,6 +87,13 @@ pub const LOGS_DIR_NAME: &str = "logs";
 pub const METADATA_FILE_NAME: &str = "metadata.json";
 /// Kill switch state persistence filename.
 pub const KILLSWITCH_STATE_FILE: &str = "killswitch.state";
+/// Cached real IP persistence filename. Holds the user's last-known
+/// pre-VPN public IP so the Security Guard can populate the `Real IP`
+/// row across vortix restarts — including the launch-with-VPN-up
+/// case where vortix has no opportunity to learn the real IP from
+/// telemetry in its current process lifetime. Format:
+/// `<ip>\n<unix-timestamp>\n`. Mode 0600.
+pub const REAL_IP_CACHE_FILE: &str = "real-ip.cache";
 
 // === Platform-Specific Paths ===
 
@@ -194,6 +201,13 @@ pub const KILLSWITCH_EMERGENCY_MSG: &str =
 
 /// Subdirectory under the Vortix config dir for `OpenVPN` runtime files (pid, log).
 pub const OPENVPN_RUN_DIR: &str = "run";
+
+/// Subdirectory under the Vortix config dir for per-session scratch configs
+/// (e.g. `WireGuard` secondaries with `DNS =` stripped — plan #009 U13).
+/// Created at mode `0o700`; per-session subdirs live one level deeper so a
+/// crashed disconnect leaves an orphan that the next startup's session-
+/// liveness sweep collects unambiguously by name.
+pub const TMP_CONFIG_DIR: &str = "tmp";
 /// `OpenVPN` log line indicating successful tunnel establishment.
 pub const OVPN_LOG_SUCCESS: &str = "Initialization Sequence Completed";
 /// `OpenVPN` log patterns indicating definitive failure.

@@ -8,10 +8,10 @@ use std::time::{Duration, Instant};
 
 use crate::core::scanner;
 use crate::message::Message;
-use crate::state::{ConnectionState, DetailedConnectionInfo, Protocol};
+use crate::state::Protocol;
 use crate::utils;
 
-use super::VpnEngine;
+use super::VpnRuntime;
 
 /// Result of a CLI connect operation.
 #[derive(Debug)]
@@ -39,8 +39,17 @@ pub struct StatusSnapshot {
     pub quality: Option<String>,
     pub download_bytes: Option<String>,
     pub upload_bytes: Option<String>,
-    pub killswitch_mode: String,
-    pub killswitch_state: String,
+    /// Kill switch mode — the typed enum. Call sites format it via
+    /// [`crate::state::KillSwitchMode::display_name`] (prose for humans:
+    /// `Off` / `Block on drop` / `VPN-only`) or
+    /// [`crate::state::KillSwitchMode::cli_verb`] (slug for the CLI verb +
+    /// JSON envelope: `off` / `block-on-drop` / `vpn-only`). One
+    /// vocabulary, two casings, no duplicated string fields.
+    pub killswitch_mode: crate::state::KillSwitchMode,
+    /// Kill switch state — typed enum. See the helpers
+    /// [`crate::state::KillSwitchState::display_status`] (prose) and
+    /// [`crate::state::KillSwitchState::cli_verb`] (slug).
+    pub killswitch_state: crate::state::KillSwitchState,
     pub dns_leak: Option<bool>,
     pub ipv6_leak: Option<bool>,
     pub encryption: Option<String>,
@@ -48,7 +57,7 @@ pub struct StatusSnapshot {
     pub isp: Option<String>,
 }
 
-impl VpnEngine {
+impl VpnRuntime {
     /// Validate preconditions for a connect and return profile metadata.
     fn validate_connect(
         &self,
@@ -96,6 +105,12 @@ impl VpnEngine {
     }
 
     /// Blocking connect for CLI — waits until connected or timeout.
+    ///
+    /// The headless `VpnRuntime` carries no shared `connection_state`
+    /// field. On success this helper syncs the kill switch via the
+    /// scanner-derived `killswitch_view_from_scanner` so the persisted
+    /// active-tunnel slice reflects every kernel-visible tunnel (not
+    /// just the one this CLI call brought up).
     pub fn connect_and_wait(
         &mut self,
         profile_name: &str,
@@ -119,11 +134,6 @@ impl VpnEngine {
             );
         });
 
-        self.connection_state = ConnectionState::Connecting {
-            started: Instant::now(),
-            profile: name.clone(),
-        };
-
         let deadline = Instant::now() + timeout + Duration::from_secs(5);
         loop {
             match self.cmd_rx.recv_timeout(Duration::from_millis(500)) {
@@ -131,19 +141,9 @@ impl VpnEngine {
                     profile,
                     success,
                     error,
+                    ..
                 }) => {
                     if success {
-                        self.connection_state = ConnectionState::Connected {
-                            profile: profile.clone(),
-                            server_location: self
-                                .profiles
-                                .iter()
-                                .find(|p| p.name == profile)
-                                .map_or_else(|| "Unknown".into(), |p| p.location.clone()),
-                            since: Instant::now(),
-                            latency_ms: 0,
-                            details: Box::new(DetailedConnectionInfo::default()),
-                        };
                         self.session_start = Some(Instant::now());
                         self.last_connected_profile = Some(profile.clone());
 
@@ -151,9 +151,15 @@ impl VpnEngine {
                             p.last_used = Some(std::time::SystemTime::now());
                         }
                         self.save_metadata();
-                        self.sync_killswitch();
+
+                        // Build the killswitch active-tunnel slice from
+                        // the scanner so we persist EVERY active tunnel,
+                        // not just this CLI invocation's. Without this
+                        // the on-disk killswitch slice would drop any
+                        // tunnel a concurrent TUI session was tracking.
+                        let (is_connected, active) = self.killswitch_view_from_scanner();
+                        self.sync_killswitch(is_connected, &active);
                     } else {
-                        self.connection_state = ConnectionState::Disconnected;
                         self.cleanup_vpn_resources(&profile);
                     }
 
@@ -168,7 +174,6 @@ impl VpnEngine {
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                     if Instant::now() >= deadline {
                         self.cleanup_vpn_resources(&name);
-                        self.connection_state = ConnectionState::Disconnected;
                         return Ok(ConnectResult {
                             profile: name,
                             protocol,
@@ -187,50 +192,31 @@ impl VpnEngine {
     }
 
     /// Blocking disconnect for CLI.
+    ///
+    /// Callers pass `profile_name` (and the optional `pid` from the
+    /// scanner's `ActiveSession`) explicitly — no shared
+    /// `connection_state` field for the helper to discover the
+    /// in-flight profile from. `vortix down` / `vortix reconnect` in
+    /// `cli/commands.rs` already iterate scanner sessions and call
+    /// this once per profile.
     #[allow(clippy::too_many_lines)]
-    pub fn disconnect_and_wait(&mut self, force: bool, timeout: Duration) -> Result<(), String> {
-        let (profile_name, protocol, config_path, pid) = match &self.connection_state {
-            ConnectionState::Connected {
-                profile, details, ..
-            } => {
-                let p = self.profiles.iter().find(|p| p.name == *profile);
-                if let Some(prof) = p {
-                    (
-                        profile.clone(),
-                        prof.protocol,
-                        prof.config_path.clone(),
-                        details.pid,
-                    )
-                } else {
-                    return Err(format!("Profile '{profile}' not found in loaded profiles"));
-                }
-            }
-            ConnectionState::Disconnected => return Ok(()), // Idempotent
-            ConnectionState::Connecting { profile, .. } => {
-                let p = self.profiles.iter().find(|p| p.name == *profile);
-                if let Some(prof) = p {
-                    (
-                        profile.clone(),
-                        prof.protocol,
-                        prof.config_path.clone(),
-                        None,
-                    )
-                } else {
-                    return Err("Cannot disconnect: profile not found".into());
-                }
-            }
-            ConnectionState::Disconnecting { .. } => {
-                return Err("Already disconnecting".into());
-            }
-        };
+    pub fn disconnect_and_wait(
+        &mut self,
+        profile_name: &str,
+        pid: Option<u32>,
+        force: bool,
+        timeout: Duration,
+    ) -> Result<(), String> {
+        let profile_name = profile_name.to_string();
+        let prof = self
+            .profiles
+            .iter()
+            .find(|p| p.name == profile_name)
+            .ok_or_else(|| format!("Profile '{profile_name}' not found in loaded profiles"))?;
+        let (protocol, config_path) = (prof.protocol, prof.config_path.clone());
 
         let cmd_tx = self.cmd_tx.clone();
         let pn = profile_name.clone();
-
-        self.connection_state = ConnectionState::Disconnecting {
-            started: Instant::now(),
-            profile: profile_name.clone(),
-        };
 
         // Plan #004 U4: a single Tunnel::down call replaces the previous
         // ~80-line per-protocol match arm. The interface name carried on the
@@ -291,9 +277,16 @@ impl VpnEngine {
         loop {
             match self.cmd_rx.recv_timeout(Duration::from_millis(500)) {
                 Ok(Message::DisconnectResult { success, error, .. }) => {
-                    self.connection_state = ConnectionState::Disconnected;
                     self.session_start = None;
-                    self.sync_killswitch();
+                    // Re-read the scanner instead of assuming this CLI
+                    // disconnect was the only active tunnel — other
+                    // tunnels (started by a concurrent TUI session, or
+                    // earlier CLI invocations) must keep their
+                    // killswitch firewall rules. Without this read the
+                    // persisted slice would be empty even when B is
+                    // still up alongside the A we just took down.
+                    let (is_connected, active) = self.killswitch_view_from_scanner();
+                    self.sync_killswitch(is_connected, &active);
 
                     if success {
                         return Ok(());
@@ -304,7 +297,6 @@ impl VpnEngine {
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                     if Instant::now() >= deadline {
                         self.cleanup_vpn_resources(&profile_name);
-                        self.connection_state = ConnectionState::Disconnected;
                         self.session_start = None;
                         return Err("Disconnect timed out".into());
                     }
@@ -405,8 +397,8 @@ impl VpnEngine {
             quality: None,
             download_bytes: dl,
             upload_bytes: ul,
-            killswitch_mode: format!("{:?}", self.killswitch_mode).to_lowercase(),
-            killswitch_state: format!("{:?}", self.killswitch_state).to_lowercase(),
+            killswitch_mode: self.killswitch_mode,
+            killswitch_state: self.killswitch_state,
             dns_leak: None,
             ipv6_leak: None,
             encryption,
@@ -449,11 +441,13 @@ impl VpnEngine {
             crate::tunnel::tunnel_for(protocol, &config_dir, ovpn_verbosity, connect_timeout_secs);
 
         match tunnel.up(&profile) {
-            Ok(_handle) => {
+            Ok(handle) => {
                 let _ = cmd_tx.send(Message::ConnectResult {
                     profile: name,
                     success: true,
                     error: None,
+                    interface: Some(handle.interface_name),
+                    pid: handle.pid,
                 });
             }
             Err(err) => {
@@ -461,6 +455,8 @@ impl VpnEngine {
                     profile: name,
                     success: false,
                     error: Some(format!("{protocol}: {err}")),
+                    interface: None,
+                    pid: None,
                 });
             }
         }

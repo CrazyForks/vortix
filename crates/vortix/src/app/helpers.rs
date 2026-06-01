@@ -10,6 +10,135 @@ use crate::logger::{self, LogLevel};
 use crate::utils;
 
 impl App {
+    /// Derive a legacy `ConnectionState` view from the registry primary.
+    ///
+    /// Post-P5d the App layer no longer carries a `connection_state`
+    /// field on `VpnRuntime`; this method computes the single-tunnel
+    /// view from `registry.primary()`. Falls back to the first
+    /// non-Disconnected entry when no primary is set (so Connecting
+    /// transitions surface before the FSM owns the default route).
+    ///
+    /// Used by code paths that still think in single-tunnel terms
+    /// (kill switch sync, profile delete safety, scanner dispatch).
+    /// All multi-tunnel-aware paths read `app.registry.snapshot_all`
+    /// directly.
+    #[must_use]
+    pub fn legacy_state(&self) -> crate::vpn_runtime::ConnectionState {
+        use crate::vortix_core::engine::state::Connection;
+        use crate::vpn_runtime::{ConnectionState, DetailedConnectionInfo};
+
+        let snap = self
+            .registry
+            .primary()
+            .and_then(|pid| self.registry.snapshot(pid))
+            .or_else(|| {
+                self.registry
+                    .snapshot_all()
+                    .into_iter()
+                    .find(|s| !matches!(s.state, Connection::Disconnected { .. }))
+            });
+        let Some(snap) = snap else {
+            return ConnectionState::Disconnected;
+        };
+
+        let now = std::time::SystemTime::now();
+        let to_instant = |t: std::time::SystemTime| {
+            now.duration_since(t)
+                .ok()
+                .and_then(|d| Instant::now().checked_sub(d))
+                .unwrap_or_else(Instant::now)
+        };
+
+        match snap.state {
+            Connection::Disconnected { .. } => ConnectionState::Disconnected,
+            Connection::Connecting { started_at, .. }
+            | Connection::Reconnecting { started_at, .. } => ConnectionState::Connecting {
+                started: to_instant(started_at),
+                profile: snap.profile_id.as_str().to_string(),
+            },
+            Connection::AwaitingUserInput { since, .. } => ConnectionState::Connecting {
+                started: to_instant(since),
+                profile: snap.profile_id.as_str().to_string(),
+            },
+            Connection::Connected { since, details, .. } => {
+                let server_location = self
+                    .runtime
+                    .profiles
+                    .iter()
+                    .find(|p| p.name == snap.profile_id.as_str())
+                    .map_or_else(|| "Unknown".to_string(), |p| p.location.clone());
+                ConnectionState::Connected {
+                    since: to_instant(since),
+                    profile: snap.profile_id.as_str().to_string(),
+                    server_location,
+                    latency_ms: 0,
+                    details: Box::new(DetailedConnectionInfo {
+                        interface: details.interface.clone(),
+                        internal_ip: details.internal_ip.clone(),
+                        endpoint: details.endpoint.clone(),
+                        mtu: details.mtu.clone(),
+                        public_key: details.public_key.clone(),
+                        listen_port: details.listen_port.clone(),
+                        transfer_rx: details.transfer_rx.clone(),
+                        transfer_tx: details.transfer_tx.clone(),
+                        latest_handshake: details.latest_handshake.clone(),
+                        pid: details.pid,
+                    }),
+                }
+            }
+            Connection::Disconnecting { started_at, .. } => ConnectionState::Disconnecting {
+                started: to_instant(started_at),
+                profile: snap.profile_id.as_str().to_string(),
+            },
+        }
+    }
+
+    /// Build the `ActiveTunnelInfo` slice consumed by the kill switch
+    /// from registry snapshots. Multi-tunnel-aware — every Connected
+    /// entry contributes a tunnel, with the registry's primary marked
+    /// `is_primary: true`.
+    #[must_use]
+    pub(crate) fn active_tunnels_for_killswitch(
+        &self,
+    ) -> Vec<crate::core::killswitch::ActiveTunnelInfo> {
+        use crate::core::killswitch::ActiveTunnelInfo;
+        use crate::vortix_core::engine::state::Connection;
+        let primary = self.registry.primary().cloned();
+        self.registry
+            .snapshot_all()
+            .into_iter()
+            .filter_map(|s| match s.state {
+                Connection::Connected { details, .. } => {
+                    let server_ips = details
+                        .endpoint
+                        .split(':')
+                        .next()
+                        .and_then(|h| h.parse().ok())
+                        .into_iter()
+                        .collect();
+                    let is_primary = primary.as_ref() == Some(&s.profile_id);
+                    Some(ActiveTunnelInfo {
+                        interface: details.interface.clone(),
+                        server_ips,
+                        declared_cidrs: Vec::new(),
+                        is_primary,
+                    })
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Whether the registry currently has at least one Connected tunnel.
+    #[must_use]
+    pub(crate) fn has_active_connection(&self) -> bool {
+        use crate::vortix_core::engine::state::Connection;
+        self.registry
+            .snapshot_all()
+            .iter()
+            .any(|s| matches!(s.state, Connection::Connected { .. }))
+    }
+
     /// Add a log message via centralized logger
     pub(crate) fn log(&mut self, message: &str) {
         // Parse "PREFIX: content" — the prefix determines both the category and the level.
@@ -43,10 +172,95 @@ impl App {
         let level_tag = level.prefix();
         Self::append_to_log_file(
             &format!("{timestamp} [{level_tag}] {category}: {content}"),
-            &self.engine.config_dir,
-            self.engine.config.log_rotation_size,
-            self.engine.config.log_retention_days,
+            &self.runtime.config_dir,
+            self.runtime.config.log_rotation_size,
+            self.runtime.config.log_retention_days,
         );
+    }
+
+    /// Count active tunnels for keybinding decisions (multi-connection plan
+    /// #001 U19). "Active" means the FSM is not `Disconnected` — that
+    /// includes `Connecting`, `Connected`, `Disconnecting`,
+    /// `AwaitingUserInput`, and any other in-flight states.
+    #[must_use]
+    pub(crate) fn active_tunnel_count(&self) -> usize {
+        use crate::vortix_core::engine::state::Connection;
+        self.registry
+            .snapshot_all()
+            .iter()
+            .filter(|s| !matches!(s.state, Connection::Disconnected { .. }))
+            .count()
+    }
+
+    /// Return the list of `ProfileId`s for currently-active tunnels in a
+    /// stable order. Used by the `Tab` focus-cycle in Connection Details.
+    pub(crate) fn active_tunnel_ids(&self) -> Vec<crate::vortix_core::profile::ProfileId> {
+        use crate::vortix_core::engine::state::Connection;
+        let mut out: Vec<_> = self
+            .registry
+            .snapshot_all()
+            .into_iter()
+            .filter(|s| !matches!(s.state, Connection::Disconnected { .. }))
+            .map(|s| s.profile_id)
+            .collect();
+        out.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        out
+    }
+
+    /// Whether the profile at `idx` is currently in a Connected state. Used
+    /// by the `d` / `Enter` keybindings to decide between connect and
+    /// disconnect routing (multi-connection plan #001 U19).
+    #[must_use]
+    pub(crate) fn is_profile_connected(&self, idx: usize) -> bool {
+        use crate::vortix_core::engine::state::Connection;
+        use crate::vortix_core::profile::ProfileId;
+        let Some(profile) = self.runtime.profiles.get(idx) else {
+            return false;
+        };
+        self.registry
+            .snapshot(&ProfileId::new(&profile.name))
+            .is_some_and(|snap| matches!(snap.state, Connection::Connected { .. }))
+    }
+
+    /// Whether the named profile is currently in any non-`Disconnected` state
+    /// (`Connecting` / `Connected` / `Disconnecting` / `Reconnecting` /
+    /// `AwaitingUserInput`). Used by deletion-safety checks where we need
+    /// to refuse to delete a profile that has an in-flight or active
+    /// tunnel.
+    #[must_use]
+    pub(crate) fn is_profile_active(&self, profile_name: &str) -> bool {
+        use crate::vortix_core::engine::state::Connection;
+        use crate::vortix_core::profile::ProfileId;
+        self.registry
+            .snapshot(&ProfileId::new(profile_name))
+            .is_some_and(|snap| !matches!(snap.state, Connection::Disconnected { .. }))
+    }
+
+    /// Whether the profile at `idx` is currently Connecting (in-flight).
+    /// Used by the `c` cancel keybinding (multi-connection plan #001 U19).
+    #[must_use]
+    pub(crate) fn is_profile_connecting(&self, idx: usize) -> bool {
+        use crate::vortix_core::engine::state::Connection;
+        use crate::vortix_core::profile::ProfileId;
+        let Some(profile) = self.runtime.profiles.get(idx) else {
+            return false;
+        };
+        self.registry
+            .snapshot(&ProfileId::new(&profile.name))
+            .is_some_and(|snap| matches!(snap.state, Connection::Connecting { .. }))
+    }
+
+    /// Resolve the profile index that the Connection Details panel is
+    /// currently focused on. Always mirrors the sidebar selection —
+    /// the user picks which tunnel's details to view by navigating
+    /// the profile list (j/k on the sidebar). Earlier multi-tunnel
+    /// iteration added a Tab-in-Details binding to cycle across
+    /// active tunnels; that broke global panel navigation, so it was
+    /// removed and Connection Details went back to the simpler
+    /// "follow the sidebar" rule.
+    #[must_use]
+    pub(crate) fn connection_details_focused_idx(&self) -> Option<usize> {
+        self.profile_list_state.selected()
     }
 
     /// Show a toast notification and log it
@@ -78,7 +292,7 @@ impl App {
         match self.focused_panel {
             FocusedPanel::Sidebar => {
                 let current = self.profile_list_state.selected().unwrap_or(0);
-                let last = self.engine.profiles.len().saturating_sub(1);
+                let last = self.runtime.profiles.len().saturating_sub(1);
                 if current < last {
                     self.profile_list_state.select(Some(current + 1));
                 }
@@ -158,74 +372,53 @@ impl App {
         None
     }
 
-    /// Get the maximum scroll position for the config viewer.
-    /// This accounts for viewport height so scrolling stops when last line is visible.
+    /// Maximum scroll position for the config viewer overlay.
+    ///
+    /// O(1): reads the line count cached in [`CachedConfigView`] (built
+    /// once when the user opened the viewer) instead of iterating
+    /// `content.lines()` on every keystroke. Aggressive `j`/`k` /
+    /// arrow-key spam used to wedge the TUI here because each call paid
+    /// the full file scan; now it's a struct-field read.
     pub(crate) fn get_config_max_scroll(&self) -> u16 {
-        if let Some(content) = &self.cached_config_content {
-            #[allow(clippy::cast_possible_truncation)]
-            let total_lines = content.lines().count() as u16;
-            let viewport_height = (self.terminal_size.1 * constants::CONFIG_VIEWER_HEIGHT_PCT
-                / 100)
-                .saturating_sub(constants::CONFIG_VIEWER_CHROME_LINES);
-            return total_lines.saturating_sub(viewport_height);
-        }
-        0
+        let Some(cached) = self.cached_config.as_ref() else {
+            return 0;
+        };
+        let viewport_height = (self.terminal_size.1 * constants::CONFIG_VIEWER_HEIGHT_PCT / 100)
+            .saturating_sub(constants::CONFIG_VIEWER_CHROME_LINES);
+        cached.total_lines.saturating_sub(viewport_height)
     }
 
-    /// Copy public IP address to clipboard
+    /// Copy public IP address to clipboard.
+    ///
+    /// Plan 002 U8: replaced platform-specific shell-outs (pbcopy on
+    /// macOS; xclip/wl-copy/xsel on Linux) with the `arboard` crate,
+    /// which auto-detects the platform clipboard backend. Users no
+    /// longer need any of those binaries installed.
     pub(crate) fn copy_ip_to_clipboard(&mut self) {
-        let ip_str = self.engine.public_ip.clone();
+        let ip_str = self.runtime.public_ip.clone();
         if ip_str.is_empty() || ip_str == constants::MSG_FETCHING || ip_str.starts_with("Error") {
             self.show_toast("No valid IP available yet".to_string(), ToastType::Error);
             return;
         }
-        #[cfg(target_os = "macos")]
-        // xtask:allow-platform-cfg: pbcopy is macOS-only; future Clipboard port
-        {
-            use crate::vortix_process::CommandSpec;
-            if crate::vortix_process::run_to_output(
-                CommandSpec::oneshot("pbcopy", vec![]).stdin(ip_str.as_bytes().to_vec()),
-            )
-            .is_ok()
-            {
-                self.show_toast(format!("Copied IP: {ip_str}"), ToastType::Success);
-                return;
-            }
-        }
-        #[cfg(target_os = "linux")]
-        // xtask:allow-platform-cfg: wl-copy/xclip/xsel selection is Linux-only; future Clipboard port
-        {
-            use crate::vortix_process::CommandSpec;
-            // Wayland-first: try wl-copy when $WAYLAND_DISPLAY is set,
-            // then fall back to X11 tools (xclip, xsel).
-            let is_wayland = std::env::var("WAYLAND_DISPLAY").is_ok();
-            let tools: &[(&str, &[&str])] = if is_wayland {
-                &[
-                    ("wl-copy", &[]),
-                    ("xclip", &["-selection", "clipboard"]),
-                    ("xsel", &["--clipboard", "--input"]),
-                ]
-            } else {
-                &[
-                    ("xclip", &["-selection", "clipboard"]),
-                    ("xsel", &["--clipboard", "--input"]),
-                    ("wl-copy", &[]),
-                ]
-            };
-            for (cmd, args) in tools {
-                let owned_args: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
-                if let Ok(o) = crate::vortix_process::run_to_output(
-                    CommandSpec::oneshot(*cmd, owned_args).stdin(ip_str.as_bytes().to_vec()),
-                ) {
-                    if o.status.success() {
-                        self.show_toast(format!("Copied IP: {ip_str}"), ToastType::Success);
-                        return;
-                    }
+        match arboard::Clipboard::new() {
+            Ok(mut clipboard) => match clipboard.set_text(ip_str.clone()) {
+                Ok(()) => {
+                    self.show_toast(format!("Copied IP: {ip_str}"), ToastType::Success);
                 }
+                Err(e) => {
+                    self.show_toast(
+                        format!("Failed to copy to clipboard: {e}"),
+                        ToastType::Error,
+                    );
+                }
+            },
+            Err(e) => {
+                // Common in headless environments (CI, SSH without
+                // X-forwarding). Match the prior implementation's
+                // soft-fail behavior.
+                self.show_toast(format!("Clipboard unavailable: {e}"), ToastType::Error);
             }
         }
-        #[allow(unreachable_code)]
-        self.show_toast("Failed to copy to clipboard".to_string(), ToastType::Error);
     }
 
     /// Append log entry to file with automatic rotation

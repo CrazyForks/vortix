@@ -12,7 +12,18 @@ categories = ["command-line-utilities", "network-programming"]
 homepage = "https://docs.rs/vortix"
 documentation = "https://docs.rs/vortix"
 readme = "../../README.md"
+# Keep the published crate small. README.md is the only doc shipped to
+# crates.io / docs.rs; everything else (CHANGELOG, CLAUDE.md, docs/,
+# manual-testing plans, planning artifacts) lives in the GitHub repo
+# only. `cargo package` already skips workspace-root files that aren't
+# explicitly referenced, so the workspace-level CHANGELOG / CLAUDE.md /
+# docs/ are out of the bundle automatically — the entries below cover
+# the per-crate CHANGELOG.md that release-plz generates and the
+# integration tests (not runnable by downstream consumers of the
+# binary; they only inflate the tarball).
 exclude = [
+    "CHANGELOG.md",
+    "tests/*",
     "../../assets/*",
     "../../.github/*",
     "../../target/*",
@@ -60,7 +71,6 @@ open = { workspace = true }
 urlencoding = { workspace = true }
 
 # Dependencies from merged internal crates
-base64 = "0.22"
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "net", "io-util", "time"] }
@@ -68,16 +78,39 @@ thiserror = { workspace = true }
 directories = { workspace = true }
 enum_dispatch = { workspace = true }
 figment = { workspace = true }
-keyring = { workspace = true }
-aes-gcm = { workspace = true }
-argon2 = { workspace = true }
-zeroize = { workspace = true }
-rand = "0.10"
-sha2 = "0.11"
+sha2 = "0.10"
+# Plan 002 U8: text-only clipboard. Image features pull in `image` /
+# `x11rb` / `zune-*` deps for clipboard image support we don't use;
+# disable defaults to keep binary lean.
+arboard = { version = "3.6.1", default-features = false }
+# Plan 002 U10: raw socket for ICMP echo (replaces `ping` shell-out).
+# Thin libc wrapper; we hand-roll the 8-byte ICMP packet + RFC 792
+# checksum and fall back to TCP-connect-port-443 when the kernel
+# refuses unprivileged ICMP.
+socket2 = "0.5"
+# Plan 002 U9 (revised): blocking HTTP for telemetry (replaces `curl`).
+# Picked `ureq` over `reqwest::blocking` because we don't share vortix's
+# tokio runtime from the std::thread-based telemetry workers anyway —
+# `reqwest::blocking`'s embedded current_thread runtime would have been
+# overhead with no upside. `rustls` to avoid OpenSSL; `json` for typed
+# IP-API responses.
+ureq = { version = "3", default-features = false, features = ["rustls", "json"] }
 
 # System calls (for root detection + platform crates)
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# Plan 002 U7: macOS SystemConfiguration framework bindings for DNS
+# resolution (replaces `scutil --dns` and `networksetup -getdnsservers`
+# shell-outs). The crate covers the State:/Network/Global/DNS dynamic
+# store key directly; the netstat / lsof replacements use libc +
+# hand-rolled libproc FFI rather than this crate (not covered by it).
+[target.'cfg(target_os = "macos")'.dependencies]
+# `system-configuration` re-exports its own `core_foundation` (0.9.x); we
+# import `CFDictionary` / `CFArray` / `CFString` etc. through that re-export
+# rather than depending on `core-foundation` directly so the two versions
+# can't drift apart.
+system-configuration = "0.7"
 
 [dev-dependencies]
 tempfile = { workspace = true }

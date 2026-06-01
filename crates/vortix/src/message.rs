@@ -78,8 +78,39 @@ pub enum Message {
     OpenDelete(Option<usize>),
     /// Confirm deletion
     ConfirmDelete,
-    /// Confirm VPN profile switch
-    ConfirmSwitch { idx: usize },
+    /// Confirm default-route takeover (multi-connection plan #001 U7 —
+    /// formerly `ConfirmSwitch`). User accepted the overlay; retry the
+    /// connect with `force=true`. Both tunnels stay connected per
+    /// plan SC3 ("primary inverts").
+    ConfirmDefaultRouteTakeover { idx: usize },
+    /// User chose the legacy single-tunnel "switch" path on the
+    /// default-route takeover overlay: disconnect the current tunnel
+    /// first, then connect the new one. Fired by the `[S]` hotkey on
+    /// the overlay (distinct from `[Y]es` which keeps both tunnels up).
+    SwitchExclusiveAndConnect { idx: usize },
+    /// Confirm route-overlap (multi-connection plan #001 U7, R10). User
+    /// accepted the AllowedIPs-overlap overlay; retry the connect with
+    /// `force=true`.
+    ConfirmRouteOverlap { idx: usize },
+    /// Multi-connection plan #001 U19: disconnect one specific profile by
+    /// index (the `d` keybinding on a Connected sidebar row). Distinct from
+    /// the global `Disconnect` message which targets the legacy single-
+    /// tunnel active profile.
+    DisconnectProfile { idx: usize },
+    /// Multi-connection plan #001 U19: open the "Disconnect all N tunnels?"
+    /// confirmation dialog (the Shift+`D` keybinding when N>1). Fired from
+    /// the sidebar; with N≤1 the input layer dispatches `DisconnectProfile`
+    /// instead and this message is never sent.
+    RequestDisconnectAll,
+    /// Multi-connection plan #001 U19: user accepted the
+    /// `InputMode::ConfirmDisconnectAll` overlay; tear down every active
+    /// tunnel (registry-aware) plus the legacy single-tunnel state.
+    ConfirmDisconnectAll,
+    /// Multi-connection plan #001 U19: cancel an in-flight connect (the
+    /// `c` keybinding on a Connecting row's Connection Details). FSM
+    /// transitions Connecting → Disconnected and the sidebar row clears
+    /// the badge.
+    CancelConnect { idx: usize },
 
     // === Action Menu ===
     /// Open the action menu (Single actions)
@@ -106,8 +137,16 @@ pub enum Message {
     Quit,
     /// Background telemetry update
     Telemetry(TelemetryUpdate),
-    /// Periodic system state synchronization (active profiles)
-    SyncSystemState(Vec<ActiveSession>),
+    /// Periodic system state synchronization (active profiles +
+    /// default-route interface). The route iface is probed by the
+    /// scanner's background thread alongside the active-session work
+    /// so the main thread NEVER blocks on `route get default` /
+    /// `ip route show default` — the registry's primary-tunnel
+    /// election reads the cached value handed in here.
+    SyncSystemState {
+        sessions: Vec<ActiveSession>,
+        default_route_interface: Option<String>,
+    },
     /// Periodic heartbeat tick
     Tick,
     /// Connection timeout detected
@@ -129,6 +168,19 @@ pub enum Message {
         success: bool,
         /// Error message if the command failed
         error: Option<String>,
+        /// Kernel-visible interface name as returned by the protocol
+        /// layer's `Tunnel::up()` (`OpenVPN` log scrape, wg-quick output
+        /// resolved via platform port). `Some(_)` on success;
+        /// `None` on failure or when the protocol-layer result didn't
+        /// carry one. This field is the only path from the connect-
+        /// worker thread back to `mirror_connect_into_registry`, so it
+        /// IS the authoritative iface seed for the new registry entry.
+        /// See R1 of docs/brainstorms/2026-06-01-multi-tunnel-state-
+        /// authority-requirements.md.
+        interface: Option<String>,
+        /// Kernel PID from the protocol layer's `Tunnel::up()` result.
+        /// Same flow rationale as `interface`.
+        pid: Option<u32>,
     },
     /// Result from the background disconnect thread
     DisconnectResult {

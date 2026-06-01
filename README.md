@@ -1,8 +1,8 @@
 # Vortix
 
 [![CI](https://github.com/Harry-kp/vortix/actions/workflows/ci.yml/badge.svg)](https://github.com/Harry-kp/vortix/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://github.com/Harry-kp/vortix/blob/main/LICENSE)
+[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/Harry-kp/vortix/blob/main/CONTRIBUTING.md)
 [![Crates.io](https://img.shields.io/crates/v/vortix.svg)](https://crates.io/crates/vortix)
 [![Crates.io Downloads](https://img.shields.io/crates/d/vortix.svg)](https://crates.io/crates/vortix)
 [![npm](https://img.shields.io/npm/v/@harry-kp/vortix?logo=npm)](https://www.npmjs.com/package/@harry-kp/vortix)
@@ -17,13 +17,24 @@
 
 Terminal UI for WireGuard and OpenVPN with real-time telemetry and leak guarding.
 
-> **New in v0.3.0 — architectural migration v1.** Engine FSM (internal), session journal, encrypted secret store. One new top-level subcommand (`vortix secrets`); existing CLI unchanged. Upgrade is automatic.
+> **New in v0.4.0 — multi-tunnel.** Run multiple VPN tunnels at the
+> same time; one owns the kernel default route (the *primary*), the
+> rest are *addressable* on their declared `AllowedIPs`. Per-profile
+> retry and auto-reconnect. Scanner auto-adopts externally-started
+> tunnels. JSON status envelope bumps to `schema_version: 2` with
+> `data.connections[]` + `data.primary`. Kill switch **VPN-only** mode
+> now keeps the firewall engaged whether the VPN is up or down
+> (canonical Linux killswitch shape — closes a
+> gap-between-drop-and-reconnect leak path). See the
+> [CHANGELOG](https://github.com/Harry-kp/vortix/blob/main/CHANGELOG.md) for the full list.
 >
-> - [Release notes](docs/v0.3.0-RELEASE-NOTES.md) — what changed (60s read)
-> - [Upgrade guide](docs/MIGRATION.md) — for v0.2.x users
-> - [FAQ](docs/v0.3.0-FAQ.md) — common upgrade questions
+> **v0.3.0 migration** (Engine FSM, session journal, encrypted secret store):
+>
+> - [Release notes](https://github.com/Harry-kp/vortix/blob/main/docs/v0.3.0-RELEASE-NOTES.md) — what changed (60s read)
+> - [Upgrade guide](https://github.com/Harry-kp/vortix/blob/main/docs/MIGRATION.md) — for v0.2.x users
+> - [FAQ](https://github.com/Harry-kp/vortix/blob/main/docs/v0.3.0-FAQ.md) — common upgrade questions
 
-![Vortix Demo](assets/demo.gif)
+![Vortix Demo](https://raw.githubusercontent.com/Harry-kp/vortix/main/assets/demo.gif)
 
 ## Why Vortix?
 
@@ -47,14 +58,14 @@ Existing options (`wg show`, NetworkManager, Tunnelblick) either lack real-time 
 ## Features
 
 - **WireGuard & OpenVPN** — Auto-detects `.conf` and `.ovpn` files
+- **Multi-tunnel** *(new in v0.4.0)* — Multiple VPN profiles connected simultaneously; the registry tracks primary + addressable secondaries; per-profile retry/auto-reconnect; auto-adopt of externally-started tunnels (`wg-quick up X` from another terminal shows up in the TUI within ~1s)
 - **Advanced Telemetry** — Real-time throughput, latency, **jitter**, and **packet loss**
 - **Geo-Location** — Instant detection of your exit IP's city and country
 - **Leak detection** — Monitors for IPv6 leaks and DNS leaks in real-time
-- **Kill Switch** — Built-in firewall management for maximum security
-- **Encrypted credential store** *(new in v0.3.0)* — OS keyring (Keychain / Secret Service) with AES-256-GCM + argon2id encrypted-file fallback for headless installs
-- **Session event journal** *(new in v0.3.0)* — JSONL event log per session under `${XDG_DATA_HOME}/vortix/sessions/`, 30-day retention; useful for diagnostics and scripting
-- **Per-process socket audit** *(new in v0.3.0)* — `vortix audit` answers "is this traffic actually routing through the tunnel?" with per-PID socket inventory; Linux + macOS supported
-- **Versioned structured output** *(new in v0.3.0)* — every `--json` envelope carries `schema_version: 1` so consumers can detect breaking changes instead of finding them at runtime
+- **Kill Switch** — Platform-native firewall (PF on macOS; `iptables` or `nftables` on Linux). Three modes — **Off** (no firewall), **Block on drop** (engages only if the VPN drops unexpectedly), **VPN-only** (firewall stays engaged whether the VPN is up or down — closes the gap-between-drop-and-reconnect leak window). Multi-tunnel-aware: every active tunnel's interface is allow-listed
+- **Session event journal** *(v0.3.0)* — JSONL event log per session under `${XDG_DATA_HOME}/vortix/sessions/`, 30-day retention; useful for diagnostics and scripting
+- **Per-process socket audit** *(v0.3.0)* — `vortix audit` answers "is this traffic actually routing through the tunnel?" with per-PID socket inventory; Linux + macOS supported
+- **Versioned structured output** *(v0.3.0)* — every `--json` envelope carries a `schema_version` field (currently `2`) so consumers can detect breaking changes instead of finding them at runtime
 - **Interactive Import** — Easily add new profiles directly within the TUI
 - **Config Viewer** — Inspect profile configurations directly within the TUI
 - **Keyboard-driven** — No mouse required
@@ -73,14 +84,13 @@ If you use Vortix on Linux and hit a problem, please open an issue and include `
 
 | Dependency | macOS | Linux | Purpose |
 |------------|-------|-------|---------|
-| `curl` | Pre-installed | `apt install curl` | Telemetry and IP detection |
 | `openvpn` | `brew install openvpn` | `apt install openvpn` | OpenVPN sessions |
 | `wireguard-tools` | `brew install wireguard-tools` | `apt install wireguard-tools` | WireGuard sessions |
 | `resolvconf` / `systemd-resolved` | N/A (uses native DNS) | `systemd-resolvconf` or `openresolv` | WireGuard DNS management (optional, needed if DNS in config) |
 | `iptables` or `nftables` | N/A (uses `pfctl`) | Pre-installed | Kill switch |
-| `iproute2` | N/A (uses `ifconfig`) | Pre-installed | Interface detection |
 
 > Vortix checks for missing tools at startup and shows a warning toast with install instructions.
+> Interface inspection, network stats, DNS detection, HTTP telemetry, ICMP latency, and clipboard handoff now run in-process — no `curl`, `ping`, `which`, `ifconfig`, `ip addr`, `ps`, `netstat`, `lsof`, `scutil`, `pbcopy`, or `xclip` shell-out required.
 
 **DNS tools note:** If your WireGuard profile includes a `DNS =` directive, Vortix will automatically detect and warn about missing DNS tools. Install accordingly:
 - **Arch/Fedora (systemd-based):** `sudo pacman -S systemd-resolvconf` or `sudo dnf install systemd-resolved`
@@ -96,17 +106,17 @@ If you use Vortix on Linux and hit a problem, please open an issue and include `
 
 **Ubuntu/Debian:**
 ```bash
-sudo apt install curl wireguard-tools openvpn iptables iproute2 systemd-resolved
+sudo apt install wireguard-tools openvpn iptables systemd-resolved
 ```
 
 **Fedora/RHEL:**
 ```bash
-sudo dnf install curl wireguard-tools openvpn iptables iproute systemd-resolved
+sudo dnf install wireguard-tools openvpn iptables systemd-resolved
 ```
 
 **Arch Linux** (only needed for source builds — `pacman -S vortix` handles deps automatically):
 ```bash
-sudo pacman -S curl wireguard-tools openvpn iptables iproute2 systemd-resolvconf
+sudo pacman -S wireguard-tools openvpn iptables systemd-resolvconf
 ```
 
 > **DNS management:** Vortix uses `resolvconf` (via `systemd-resolvconf` or `openresolv`) to manage DNS when your WireGuard profile contains `DNS =`. On systemd distros (most modern Linux), this is automatic via systemd-resolved. Non-systemd distros (Alpine, Void, Gentoo OpenRC) will use `/etc/resolv.conf` editing as a fallback.
@@ -142,7 +152,7 @@ curl --proto '=https' --tlsv1.2 -LsSf https://github.com/Harry-kp/vortix/release
 
 **Static binary (Linux):**
 
-Download the `x86_64-unknown-linux-musl` release from the [releases page](https://github.com/Harry-kp/vortix/releases). This is a statically linked binary (no glibc needed), but you still need the runtime dependencies above (curl, openvpn/wireguard-tools, etc.).
+Download the `x86_64-unknown-linux-musl` release from the [releases page](https://github.com/Harry-kp/vortix/releases). This is a statically linked binary (no glibc needed), but you still need the runtime dependencies above (openvpn/wireguard-tools and the kill-switch tools).
 
 **Nix (flakes):**
 ```bash
@@ -194,17 +204,30 @@ sudo vortix              # Launch TUI dashboard (default)
 
 Every subcommand supports `--json` for machine-readable output and `--quiet` for silent operation (exit code only).
 
-**Connection:**
+**Connection (multi-tunnel aware):**
 ```bash
 sudo vortix up work-vpn         # Connect to a profile
-sudo vortix down                # Disconnect (graceful)
+sudo vortix up vpn-b --yes      # Bypass the conflict gate (default-route
+                                # takeover / route overlap with another
+                                # active tunnel; non-interactive)
+sudo vortix down                # Disconnect every active tunnel
+sudo vortix down work-vpn       # Disconnect only the named profile
 sudo vortix down --force        # Force-disconnect (SIGKILL)
-sudo vortix reconnect           # Reconnect to last used profile
+sudo vortix reconnect           # Cycle every currently-Connected tunnel
 vortix status                   # Show connection state + telemetry
+vortix status --json            # v2 envelope: data.connections[] +
+                                # data.primary (back-compat data.connection
+                                # populated when exactly one tunnel is up)
 vortix status --brief           # One-line: "● Connected to work-vpn"
 vortix status --watch           # Live updates every 2s
 vortix status --watch --json    # NDJSON stream for monitoring
 ```
+
+Multiple tunnels can be active simultaneously. The tunnel that owns the
+kernel default route is the *primary*; secondaries are *addressable*
+(reachable on their declared `AllowedIPs` only). `vortix up B` while
+A is up triggers a conflict gate when both claim the default route or
+when their `AllowedIPs` overlap — pass `--yes` to bypass for scripts.
 
 **Profile Management:**
 ```bash
@@ -221,9 +244,15 @@ vortix rename old-vpn new-vpn   # Rename a profile
 
 **Security:**
 ```bash
-sudo vortix killswitch auto     # Set kill switch to auto mode
-sudo vortix killswitch always   # Always-on kill switch
-vortix killswitch               # Show current mode
+# Kill switch — one label per mode, used in the TUI, JSON envelope,
+# CLI input, and CLI output alike.
+#   off             All traffic flows. Real IP exposed if VPN drops.
+#   block-on-drop   Block traffic only if the VPN drops unexpectedly.
+#   vpn-only        Only VPN traffic permitted. No internet without a VPN.
+sudo vortix killswitch off
+sudo vortix killswitch block-on-drop
+sudo vortix killswitch vpn-only
+vortix killswitch               # Show current mode + behaviour
 sudo vortix release-killswitch  # Emergency firewall release
 ```
 
@@ -236,16 +265,9 @@ vortix completions bash >> ~/.bashrc      # Shell completions
 vortix completions zsh > ~/.zfunc/_vortix
 ```
 
-**New in v0.3.0 — secrets store, socket audit, daemon skeleton, profile-export flag (additive):**
+**Advanced subcommands (socket audit, daemon):**
 
 ```bash
-# Encrypted secret store — OS keyring (Keychain / Secret Service) with
-# AES-256-GCM + argon2id fallback. Opt-in; existing .auth files keep
-# working unchanged.
-echo -n 'user:pass' | vortix secrets set creds/work-vpn
-vortix secrets get creds/work-vpn
-vortix secrets delete creds/work-vpn
-
 # Per-process socket audit — "is this traffic actually routing
 # through the tunnel?" Pull-based snapshots; Linux + macOS supported.
 vortix audit                                  # tabular
@@ -253,16 +275,12 @@ vortix audit --json                           # structured envelope
 vortix audit --pid 12345                      # filter to one process
 vortix audit --vpn-only                       # only sockets on the tunnel
 
-# Daemon IPC skeleton — host the engine as a long-running process.
-# v0.3.0 ships the wire contract + socket binding; engine routing
-# through the daemon completes in v0.3.x.
+# Daemon IPC — host the engine as a long-running process. Wire
+# contract + socket binding + UID-gated accept loop are in place
+# (single-client-at-a-time today; engine routing through the daemon
+# is follow-up work).
 vortix daemon                                 # default socket path
 vortix daemon --socket /tmp/vortix.sock       # custom path
-
-# Share a profile with credentials inlined (for the recipient to
-# re-import). The output gets a trailing `# vortix-secret:<base64>`
-# comment that v0.3.x picks up on import.
-vortix show work-vpn --raw --inline-secrets > /tmp/work-with-creds.ovpn
 ```
 
 The Engine FSM, JSONL session journal, layered settings, and sidecar
@@ -270,7 +288,7 @@ migration all live behind existing commands — the journal path
 surfaces in `vortix info` output, the migration runs at startup, and
 `settings.toml` works whether or not you ever create one.
 
-See [`docs/MIGRATION.md`](docs/MIGRATION.md) for the upgrade guide and
+See [`docs/MIGRATION.md`](https://github.com/Harry-kp/vortix/blob/main/docs/MIGRATION.md) for the upgrade guide and
 opt-in details on the secret store, journal, and daemon.
 
 **JSON output for AI agents / scripts:**
@@ -293,7 +311,7 @@ vortix status --watch --json
 | 1 | General error |
 | 2 | Permission denied (needs sudo) |
 | 3 | Not found (profile doesn't exist) |
-| 4 | State conflict (already connected) |
+| 4 | State conflict (already connected, default-route takeover, route overlap) |
 | 5 | Missing dependency |
 | 6 | Timeout |
 
@@ -301,11 +319,14 @@ vortix status --watch --json
 
 | Key | Action |
 |-----|--------|
-| `Tab` | Cycle Focus (All Panels) |
+| `Tab` | Cycle Focus (panels). Connection Details mirrors the sidebar selection — switch tunnels by navigating the profile list. |
 | `1-9` | Connect to Quick-Slot 1-9 |
 | `Enter` | Connect / Toggle Profile |
-| `d` | Disconnect Active Session |
-| `r` | Reconnect Active Session |
+| `d` | Disconnect focused tunnel (sidebar row, or primary when no sidebar focus) |
+| `D` | Disconnect ALL active tunnels (with confirm when N > 1) |
+| `c` | Cancel an in-flight `Connecting` profile from Connection Details |
+| `r` | Reconnect — cycle every Connected tunnel |
+| `B` | "Both" — from the takeover overlay, connect both tunnels (multi-tunnel) |
 | `i` | Import Profile (Direct) |
 | `v` | View Profile Configuration |
 | `y` | Copy Public IP to Clipboard |
@@ -353,9 +374,9 @@ When running with `sudo`, vortix automatically resolves the invoking user's home
 │   └── 2026-02-09.log        Same content as the TUI Logs panel
 ├── config.toml               User settings (optional, see below)
 ├── settings.toml             Figment-layered settings (optional, new in v0.3.0)
-├── secrets.enc               Encrypted secret store, fallback when no OS keyring (new in v0.3.0)
 ├── metadata.json             Profile metadata (last used, sort order)
-└── killswitch.state          Kill switch state for crash recovery
+├── killswitch.state          Kill switch state for crash recovery
+└── real-ip.cache             Cached pre-VPN public IP (Security Guard's Real IP row)
 ```
 
 Session event journals live in a separate XDG directory because they're observability data, not user config:
@@ -378,14 +399,14 @@ All files and directories under the config dir are owned by your user account, e
 | Path | Mode | Description |
 |------|:----:|-------------|
 | `profiles/` | `600` | Your `.conf` and `.ovpn` files plus the auto-generated `.meta.toml` sidecars (new in v0.3.0). Sidecars are idempotent — delete and they regenerate. |
-| `auth/` | `600` | Saved OpenVPN username/password pairs. One file per profile. Still honored in v0.3.0 — credentials can optionally move to the encrypted store via `vortix secrets set creds/<profile>`. |
+| `auth/` | `600` | Saved OpenVPN username/password pairs. One file per profile, written from the TUI's auth prompt or by manual `printf 'user\npass\n' > auth/<profile>.auth`. |
 | `run/` | `644` | **OpenVPN only.** PID and log files created during a VPN session. The `.pid` file identifies which daemon to kill; the `.log` is polled for success/failure. Cleaned up on disconnect. WireGuard doesn't use this. |
 | `logs/` | `644` | Application session logs (daily rotation, configurable size/retention). Not the raw OpenVPN output in `run/`. |
 | `config.toml` | `644` | Optional user settings (legacy). Only exists if you create it manually (see below). |
 | `settings.toml` | `644` | Optional figment-layered settings (new in v0.3.0): defaults → system file → this user file → `VORTIX_*` env vars. Not auto-created. |
-| `secrets.enc` | `600` | Encrypted-file fallback for the SecretStore (new in v0.3.0). Only created if you use `vortix secrets set` without a working OS keyring. |
 | `metadata.json` | `644` | Internal bookkeeping (last used, sort order). Auto-managed. |
 | `killswitch.state` | `644` | Persists kill switch mode across crashes. Auto-managed. |
+| `real-ip.cache` | `600` | Last-known pre-VPN public IP, written whenever vortix observes you in the un-tunneled state. Loaded on startup so the Security Guard's `Real IP` row populates immediately — including when vortix is opened while a VPN is already up. Two-line plain text (`<ip>\n<unix-timestamp>\n`). Refreshes on any future disconnected sample; stale entries (network moves while vortix is closed) self-correct the next time you disconnect. |
 
 ### Config file
 
@@ -448,25 +469,33 @@ ip_api_fallbacks = ["https://api.ipify.org", "https://icanhazip.com", "https://i
 
 ## How It Works
 
-**Telemetry:** A background thread polls system network stats every second for throughput (macOS: `netstat -ib`, Linux: `/proc/net/dev`). Network quality (latency, jitter, loss) is calculated using multi-packet ICMP probes. Public IP, ISP, and Geo-location data are fetched via `ipinfo.io/json`.
+**Telemetry:** A background thread polls system network stats every second for throughput (macOS: `libc::getifaddrs` reading BSD `if_data`; Linux: `/proc/net/dev`). Network quality (latency, jitter, loss) is measured with a hand-rolled ICMP echo probe over an unprivileged `SOCK_DGRAM` socket (falls back to TCP-connect-to-443 when ICMP is restricted). Public IP, ISP, and geo-location data are fetched via `ureq` over rustls-TLS — no `curl` shell-out, no tokio runtime overhead in the std::thread-based telemetry workers.
 
 **Security (Kill Switch & Leak Detection):**
-- **Kill Switch:** Platform-native firewall integration. macOS uses PF (Packet Filter) via `pfctl`. Linux supports both `iptables` (with a dedicated `VORTIX_KILLSWITCH` chain) and `nftables` (with an atomic `vortix_killswitch` table) for clean teardown. Automatically blocks all non-VPN traffic when connection drops.
+- **Kill Switch:** Platform-native firewall integration. macOS uses PF (Packet Filter) via `pfctl`. Linux supports `iptables` (default-DROP OUTPUT policy + explicit ACCEPT rules for loopback / RFC1918 / DHCP / each active tunnel's interface + server IPs, applied via `iptables-restore` for atomic switchover) and `nftables` (atomic `vortix_killswitch` table). Three modes — one label per mode, identical across the TUI, `vortix status` / `vortix killswitch` human output, and the JSON envelope:
+
+  | Label / CLI verb      | Behavior                                                                                                                                                   |
+  | --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+  | **`off`**             | All traffic flows; real IP exposed if VPN drops.                                                                                                           |
+  | **`block-on-drop`**   | Engage default-DROP egress *only* when an active VPN drops unexpectedly.                                                                                   |
+  | **`vpn-only`**        | Default-DROP egress stays engaged whether the VPN is up or down, so the gap between a drop and reconnect can never leak. Canonical Linux killswitch shape. |
+
+  The same three slugs are what you type (`vortix killswitch <slug>`) and what you read back (TUI, `vortix status`, JSON envelope). Multi-tunnel-aware: every Connected tunnel contributes ACCEPT rules; the persisted state survives `vortix` restarts.
 - **IPv6 Leak:** Active monitoring via `api6.ipify.org`. Any IPv6 traffic detected while VPN is active triggers a leak warning.
-- **DNS Leak:** Monitors DNS configuration to ensure nameservers align with the secure tunnel (macOS: `scutil --dns` / `networksetup`, Linux: `resolvectl` / `nmcli` / `/etc/resolv.conf`).
+- **DNS Leak:** Monitors DNS configuration to ensure nameservers align with the secure tunnel (macOS: `SCDynamicStore` via the `system-configuration` crate; Linux: `resolvectl` / `nmcli` / `/etc/resolv.conf`).
 
 **WireGuard Integration:** macOS resolves interface names via `/var/run/wireguard/*.name`. Linux uses kernel WireGuard interfaces directly (`wg0`, `wg1`, etc.). Both platforms parse `wg show` for handshake timing, transfer stats, and endpoint metadata.
 
-**OpenVPN Integration:** Tracks session uptime and connection status via `ps` proc parsing. Interface detection uses `ifconfig` on macOS and `ip addr` on Linux.
+**OpenVPN Integration:** Tracks session uptime and connection status via the macOS/Linux process-listing APIs (`libc::proc_listpids` on macOS, `/proc/<pid>/cmdline` on Linux). Interface detection uses `libc::getifaddrs` on both.
 
 ### Platform Notes
 
 | Feature | macOS | Linux |
 |---------|-------|-------|
 | Kill switch | `pfctl` (PF) | `iptables` or `nftables` |
-| Network stats | `netstat -ib` | `/proc/net/dev` |
-| Interface detection | `ifconfig` + `/var/run/wireguard/` | `ip addr` + `wg show` |
-| DNS detection | `scutil --dns`, `networksetup` | `resolvectl`, `nmcli`, `/etc/resolv.conf` |
+| Network stats | `libc::getifaddrs` + `if_data` | `/proc/net/dev` |
+| Interface detection | `libc::getifaddrs` + `/var/run/wireguard/` | `libc::getifaddrs` + `/sys/class/net/` + `wg show` |
+| DNS detection | `SCDynamicStore` (SystemConfiguration framework) | `resolvectl`, `nmcli`, `/etc/resolv.conf` |
 | Default VPN iface | `utun0` | `wg0` |
 | Tested distros | macOS 12+ | Ubuntu, Fedora, Arch |
 

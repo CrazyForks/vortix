@@ -146,15 +146,33 @@ impl App {
                     self.handle_message(Message::CloseOverlay);
                 }
             }
-            InputMode::Help { mut scroll } => {
+            InputMode::Help {
+                mut scroll,
+                mut tab,
+            } => {
                 let max_scroll = help_max_scroll_for_terminal_height(
                     self.terminal_size.1,
-                    crate::ui::help_total_lines(),
+                    crate::ui::help_total_lines(tab),
                 );
                 scroll = scroll.min(max_scroll);
                 match key.code {
                     KeyCode::Esc | KeyCode::Char('?' | 'q') => {
                         self.handle_message(Message::CloseOverlay);
+                    }
+                    KeyCode::Tab | KeyCode::BackTab => {
+                        // Tab → next, Shift+Tab → previous. Switching
+                        // tabs resets scroll because (a) tab content
+                        // varies in length and a carried-over scroll
+                        // could land outside the new tab's bounds, and
+                        // (b) users expect "switching to a new view
+                        // shows the top of it." No per-tab scroll
+                        // memory.
+                        tab = if matches!(key.code, KeyCode::BackTab) {
+                            tab.prev()
+                        } else {
+                            tab.next()
+                        };
+                        scroll = 0;
                     }
                     KeyCode::Down | KeyCode::Char('j') => {
                         scroll = scroll.saturating_add(1).min(max_scroll);
@@ -171,7 +189,7 @@ impl App {
                     _ => {}
                 }
                 if let InputMode::Help { .. } = self.input_mode {
-                    self.input_mode = InputMode::Help { scroll };
+                    self.input_mode = InputMode::Help { scroll, tab };
                 }
             }
             InputMode::Rename {
@@ -213,17 +231,105 @@ impl App {
                     }
                 }
             },
-            InputMode::ConfirmSwitch {
-                to_idx,
+            InputMode::ConfirmDefaultRouteTakeover {
+                to_profile_id,
+                mut confirm_selected,
+                ..
+            } => {
+                // Key bindings on this overlay (plan 001's multi-tunnel
+                // feature is opt-in; the legacy "switch VPNs" UX stays
+                // the default so existing users aren't surprised):
+                //
+                //   [Y]/Enter  -> SwitchExclusiveAndConnect (legacy:
+                //                 disconnect current, then connect new)
+                //   [B]/[b]    -> ConfirmDefaultRouteTakeover (new:
+                //                 keep both connected, new becomes
+                //                 active exit, old becomes split
+                //                 tunnel)
+                //   [N]/Esc    -> Cancel
+                //
+                // The Y/N cursor still navigates the Yes/No buttons.
+                // [B] is a side hotkey for the multi-connect path.
+                if matches!(key.code, KeyCode::Char('b' | 'B')) {
+                    let idx = self
+                        .runtime
+                        .profiles
+                        .iter()
+                        .position(|p| p.name == to_profile_id.as_str());
+                    if let Some(i) = idx {
+                        self.handle_message(Message::ConfirmDefaultRouteTakeover { idx: i });
+                    } else {
+                        self.handle_message(Message::CloseOverlay);
+                    }
+                    return;
+                }
+                match handle_confirm_keys(key, &mut confirm_selected) {
+                    ConfirmAction::Confirmed => {
+                        // [Y]es fires the legacy switch path. Index is
+                        // preferred over ProfileId at the Message
+                        // boundary because the downstream
+                        // `disconnect` + `pending_connect` flow is
+                        // indexed; future units can move this to
+                        // ProfileId.
+                        let idx = self
+                            .runtime
+                            .profiles
+                            .iter()
+                            .position(|p| p.name == to_profile_id.as_str());
+                        if let Some(i) = idx {
+                            self.handle_message(Message::SwitchExclusiveAndConnect { idx: i });
+                        } else {
+                            self.handle_message(Message::CloseOverlay);
+                        }
+                    }
+                    ConfirmAction::Cancelled => self.handle_message(Message::CloseOverlay),
+                    ConfirmAction::None => {
+                        if let InputMode::ConfirmDefaultRouteTakeover {
+                            confirm_selected: cs,
+                            ..
+                        } = &mut self.input_mode
+                        {
+                            *cs = confirm_selected;
+                        }
+                    }
+                }
+            }
+            InputMode::ConfirmRouteOverlap {
+                to_profile_id,
                 mut confirm_selected,
                 ..
             } => match handle_confirm_keys(key, &mut confirm_selected) {
                 ConfirmAction::Confirmed => {
-                    self.handle_message(Message::ConfirmSwitch { idx: to_idx });
+                    let idx = self
+                        .runtime
+                        .profiles
+                        .iter()
+                        .position(|p| p.name == to_profile_id.as_str());
+                    if let Some(i) = idx {
+                        self.handle_message(Message::ConfirmRouteOverlap { idx: i });
+                    } else {
+                        self.handle_message(Message::CloseOverlay);
+                    }
                 }
                 ConfirmAction::Cancelled => self.handle_message(Message::CloseOverlay),
                 ConfirmAction::None => {
-                    if let InputMode::ConfirmSwitch {
+                    if let InputMode::ConfirmRouteOverlap {
+                        confirm_selected: cs,
+                        ..
+                    } = &mut self.input_mode
+                    {
+                        *cs = confirm_selected;
+                    }
+                }
+            },
+            InputMode::ConfirmDisconnectAll {
+                mut confirm_selected,
+                ..
+            } => match handle_confirm_keys(key, &mut confirm_selected) {
+                ConfirmAction::Confirmed => self.handle_message(Message::ConfirmDisconnectAll),
+                ConfirmAction::Cancelled => self.handle_message(Message::CloseOverlay),
+                ConfirmAction::None => {
+                    if let InputMode::ConfirmDisconnectAll {
                         confirm_selected: cs,
                         ..
                     } = &mut self.input_mode
@@ -243,18 +349,18 @@ impl App {
         // let mouse events pass through to panels behind it.
         if self.input_mode != InputMode::Normal {
             match (&mut self.input_mode, mouse.kind) {
-                (InputMode::Help { scroll }, MouseEventKind::ScrollDown) => {
+                (InputMode::Help { scroll, tab }, MouseEventKind::ScrollDown) => {
                     let max_scroll = help_max_scroll_for_terminal_height(
                         self.terminal_size.1,
-                        crate::ui::help_total_lines(),
+                        crate::ui::help_total_lines(*tab),
                     );
                     *scroll = (*scroll).min(max_scroll);
                     *scroll = scroll.saturating_add(3).min(max_scroll);
                 }
-                (InputMode::Help { scroll }, MouseEventKind::ScrollUp) => {
+                (InputMode::Help { scroll, tab }, MouseEventKind::ScrollUp) => {
                     let max_scroll = help_max_scroll_for_terminal_height(
                         self.terminal_size.1,
-                        crate::ui::help_total_lines(),
+                        crate::ui::help_total_lines(*tab),
                     );
                     *scroll = (*scroll).min(max_scroll);
                     *scroll = scroll.saturating_sub(3);
@@ -300,7 +406,7 @@ impl App {
                     self.handle_message(Message::FocusPanel(panel.clone()));
 
                     if matches!(panel, crate::app::FocusedPanel::Sidebar)
-                        && !self.engine.profiles.is_empty()
+                        && !self.runtime.profiles.is_empty()
                     {
                         if let Some(area) = self.panel_areas.get(&crate::app::FocusedPanel::Sidebar)
                         {
@@ -310,7 +416,7 @@ impl App {
                                 let row_in_view = (mouse.row - inner_y) as usize;
                                 let scroll_offset = self.profile_list_state.offset();
                                 let idx = scroll_offset + row_in_view;
-                                if idx < self.engine.profiles.len() {
+                                if idx < self.runtime.profiles.len() {
                                     self.profile_list_state.select(Some(idx));
                                 }
                             }
@@ -449,7 +555,30 @@ impl App {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn handle_normal_keys(&mut self, key: KeyEvent) {
+        // Tab is reserved for panel navigation (always advances to the
+        // next UI panel). Connection Details mirrors the sidebar's
+        // current selection — switching which tunnel's details are
+        // shown happens via sidebar j/k navigation, not via a hidden
+        // Tab interception that swallowed panel-cycle behaviour when
+        // 2+ tunnels were active. (Earlier multi-tunnel iteration
+        // tried Tab-to-cycle-tunnels-in-Details; that broke panel
+        // navigation, so the binding was removed.)
+
+        // Multi-connection plan #001 U19: `c` on a Connecting row's
+        // Connection Details cancels the in-flight connect. Routed before
+        // the global `Ctrl+C` handler (Ctrl+C already short-circuited at
+        // the top of handle_key) and the panel-specific keys.
+        if key.code == KeyCode::Char('c') && self.focused_panel == FocusedPanel::ConnectionDetails {
+            if let Some(idx) = self.connection_details_focused_idx() {
+                if self.is_profile_connecting(idx) {
+                    self.handle_message(Message::CancelConnect { idx });
+                    return;
+                }
+            }
+        }
+
         match key.code {
             // Global Toggles
             KeyCode::Tab | KeyCode::Char('l') => {
@@ -494,7 +623,7 @@ impl App {
             }
             KeyCode::PageDown => {
                 let current = self.profile_list_state.selected().unwrap_or(0);
-                let last = self.engine.profiles.len().saturating_sub(1);
+                let last = self.runtime.profiles.len().saturating_sub(1);
                 let next = (current + constants::PROFILE_LIST_PAGE_SIZE).min(last);
                 self.profile_list_state.select(Some(next));
             }
@@ -509,7 +638,40 @@ impl App {
             KeyCode::Char('7') => self.handle_message(Message::QuickConnect(6)),
             KeyCode::Char('8') => self.handle_message(Message::QuickConnect(7)),
             KeyCode::Char('9') => self.handle_message(Message::QuickConnect(8)),
-            KeyCode::Char('d') => self.handle_message(Message::Disconnect),
+            // Multi-connection plan #001 U19: `d` on a Connected sidebar
+            // row disconnects that one tunnel; from any other panel `d`
+            // preserves the legacy global Disconnect path (the primary or
+            // sole active tunnel goes down).
+            KeyCode::Char('d') => {
+                if self.focused_panel == FocusedPanel::Sidebar {
+                    if let Some(idx) = self.profile_list_state.selected() {
+                        if self.is_profile_connected(idx) {
+                            self.handle_message(Message::DisconnectProfile { idx });
+                            return;
+                        }
+                    }
+                }
+                self.handle_message(Message::Disconnect);
+            }
+            // Multi-connection plan #001 U19: Shift+`D` on the sidebar
+            // opens the "Disconnect all N tunnels?" confirm when N>1; with
+            // N≤1 it acts identically to plain `d` (backwards-compatible).
+            KeyCode::Char('D') => {
+                if self.focused_panel == FocusedPanel::Sidebar {
+                    let n = self.active_tunnel_count();
+                    if n > 1 {
+                        self.handle_message(Message::RequestDisconnectAll);
+                        return;
+                    }
+                    if let Some(idx) = self.profile_list_state.selected() {
+                        if self.is_profile_connected(idx) {
+                            self.handle_message(Message::DisconnectProfile { idx });
+                            return;
+                        }
+                    }
+                }
+                self.handle_message(Message::Disconnect);
+            }
             KeyCode::Char('r') => {
                 if self.focused_panel == FocusedPanel::Sidebar {
                     self.handle_message(Message::ConnectSelected);
@@ -720,13 +882,13 @@ impl App {
 
     pub(crate) fn apply_search_filter(&mut self, query: &str) {
         if query.is_empty() {
-            self.search_match_count = self.engine.profiles.len();
+            self.search_match_count = self.runtime.profiles.len();
             self.profile_list_state.select(Some(0));
             return;
         }
         let lower = query.to_lowercase();
         let matches: Vec<usize> = self
-            .engine
+            .runtime
             .profiles
             .iter()
             .enumerate()

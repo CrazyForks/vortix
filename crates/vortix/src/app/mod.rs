@@ -5,12 +5,12 @@
 //!
 //! ## Architecture
 //!
-//! `App` embeds a [`VpnEngine`] that owns all VPN-related state (connection,
+//! `App` embeds a [`VpnRuntime`] that owns all VPN-related state (connection,
 //! profiles, telemetry, kill switch, retry logic). The TUI-specific state
 //! (panels, overlays, animations, scroll positions) remains directly on `App`.
 //!
-//! Plan #005 U5 removed `App: Deref<Target = VpnEngine>`. VPN-state
-//! accesses are now explicit via `self.engine.X` / `app.engine.X`. The
+//! Plan #005 U5 removed `App: Deref<Target = VpnRuntime>`. VPN-state
+//! accesses are now explicit via `self.runtime.X` / `app.runtime.X`. The
 //! optional `engine_handle` field carries the plan #005 `EngineHandle`
 //! for code paths that want to query/command through the FSM actor.
 //!
@@ -22,7 +22,7 @@
 //! - `telemetry_poll` — Background telemetry and scanner polling
 //! - `helpers` — Logging, scrolling, toast notifications, and utilities
 
-mod connection;
+pub(crate) mod connection;
 mod helpers;
 mod input;
 mod profile;
@@ -33,34 +33,94 @@ mod update;
 mod tests;
 
 use ratatui::layout::Rect;
+use ratatui::text::Line;
 use ratatui::widgets::TableState;
+
+/// Pre-computed view of a profile config file for the `v` overlay.
+///
+/// Built once when the user opens the viewer; reused on every render and
+/// every scroll keystroke. Without this cache, two O(N) operations
+/// happen per keypress: `content.lines().count()` to compute scroll
+/// bounds (in `helpers.rs::get_config_max_scroll`), and a fresh
+/// `content.lines().map(highlight_config_line).collect()` per render
+/// frame. Aggressive scrolling spams keys faster than the main thread
+/// can re-process the full file, so the TUI wedges. With this cache,
+/// scroll-bound checks are O(1) and the renderer just clones a Vec.
+pub struct CachedConfigView {
+    /// Raw file contents. Stored for completeness (so external code
+    /// reading `app.cached_config` sees what's actually loaded). The
+    /// renderer reads from [`Self::highlighted_lines`] instead.
+    pub content: String,
+    /// Line count computed once at load time. `u16` matches the
+    /// `Paragraph::scroll((u16, u16))` API.
+    pub total_lines: u16,
+    /// Pre-parsed + syntax-highlighted lines, ready to feed to
+    /// `Paragraph::new`. Building this is the expensive part; cloning
+    /// the Vec for `Paragraph` consumption per frame is cheap.
+    pub highlighted_lines: Vec<Line<'static>>,
+}
+
+impl CachedConfigView {
+    /// Build a fresh view from raw file content. Pre-counts lines and
+    /// pre-highlights them so the open-config keypress pays the cost
+    /// once and every subsequent scroll/render frame is constant-time.
+    #[must_use]
+    pub fn from_content(content: String) -> Self {
+        let highlighted_lines: Vec<Line<'static>> = content
+            .lines()
+            .map(crate::ui::overlays::config_viewer::highlight_config_line)
+            .collect();
+        let total_lines = u16::try_from(highlighted_lines.len()).unwrap_or(u16::MAX);
+        Self {
+            content,
+            total_lines,
+            highlighted_lines,
+        }
+    }
+}
 use std::collections::{HashMap, HashSet};
 
 use crate::constants;
-use crate::engine::VpnEngine;
 use crate::logger;
 use crate::message::Message;
+use crate::tunnel::TunnelKind;
+use crate::vortix_core::engine::TunnelRegistry;
+use crate::vpn_runtime::VpnRuntime;
 
 // Re-export state types for convenient access
 pub use crate::state::{
-    AuthField, ConnectionState, DetailedConnectionInfo, FlipAnimation, FocusedPanel, InputMode,
-    ProfileSortOrder, Protocol, Toast, ToastType, VpnProfile, DISMISS_DURATION,
+    AuthField, FlipAnimation, FocusedPanel, InputMode, ProfileSortOrder, Protocol, Toast,
+    ToastType, VpnProfile, DISMISS_DURATION,
 };
+// The legacy single-tunnel `ConnectionState`/`DetailedConnectionInfo` enum
+// lives on `crate::vpn_runtime` after U6 Stage B; re-export through `app::`
+// so the existing `app/connection.rs` / `app/update.rs` code paths that
+// drive the legacy mirror still resolve `app::ConnectionState`.
+pub use crate::vpn_runtime::{ConnectionState, DetailedConnectionInfo};
 
 /// Main application state container.
 ///
-/// Holds the VPN engine (all VPN state) and TUI-specific state (panels,
-/// overlays, animations). Implements `Deref`/`DerefMut` to `VpnEngine` so
-/// that VPN field accesses are transparent.
+/// Holds the VPN runtime (telemetry, profiles, config, background workers)
+/// alongside the `TunnelRegistry` (active tunnel FSMs) and TUI-specific
+/// state (panels, overlays, animations). Reads explicitly route through
+/// `self.runtime.X` for telemetry/profiles and `self.registry` for
+/// active-tunnel snapshots.
 #[allow(clippy::struct_excessive_bools)]
 pub struct App {
-    /// The headless VPN engine — owns all VPN state and operations.
-    pub engine: VpnEngine,
+    /// The headless VPN runtime — telemetry, profile catalog, config,
+    /// background workers, kill-switch mode. Active tunnel FSMs live on
+    /// `self.registry` (plan #001 U6).
+    pub runtime: VpnRuntime,
 
-    /// Optional plan-005 `EngineHandle`. Non-load-bearing today — the TUI
-    /// still mutates `self.engine` directly through `Deref`. Future plan
-    /// 005 U5/U6 units migrate consumers off `Deref` and onto this handle.
+    /// Optional plan-005 `EngineHandle`. Non-load-bearing today — kept for
+    /// IPC / remote-control surfaces that drive a single tunnel through the
+    /// FSM actor. Multi-tunnel callers bypass this and use `self.registry`.
     pub engine_handle: Option<crate::vortix_core::engine::EngineHandle>,
+
+    /// Multi-connection plan #001: the `TunnelRegistry` owns active tunnel
+    /// FSMs. Panels read tunnel snapshots from here (sidebar, header,
+    /// `connection_details`, security, chart).
+    pub registry: TunnelRegistry<TunnelKind>,
 
     /// Flag indicating the application should exit.
     pub should_quit: bool,
@@ -82,7 +142,12 @@ pub struct App {
     pub show_bulk_menu: bool,
     pub action_menu_state: ratatui::widgets::ListState,
     pub config_scroll: u16,
-    pub cached_config_content: Option<String>,
+    /// Cached state for the config-viewer overlay (opened with `v`).
+    /// Built once when the user opens the viewer; cleared when they
+    /// close it. Caching the highlighted `Vec<Line>` + the line count
+    /// turns aggressive scroll-spam from O(N²) (re-parse on every key)
+    /// into O(N) once + O(viewport) per frame.
+    pub cached_config: Option<CachedConfigView>,
     pub search_match_count: usize,
     pub profile_list_state: TableState,
     pub panel_areas: HashMap<FocusedPanel, Rect>,
@@ -90,27 +155,29 @@ pub struct App {
     pub terminal_size: (u16, u16),
 }
 
-// Plan 005 U5: the previous `impl Deref<Target = VpnEngine>` was a porous
-// boundary — every TUI/app/CLI callsite could reach into VpnEngine without
-// the indirection being visible at the call site. Removed. Use
-// `app.engine` / `app.engine` explicitly from now on.
+// Plan 005 U5 removed the previous `impl Deref<Target = VpnRuntime>` — the
+// porous boundary let every TUI/app/CLI callsite reach into VpnRuntime
+// without the indirection being visible at the call site. Use
+// `app.runtime.X` for runtime fields and `app.registry` for active
+// tunnels explicitly.
 
 impl App {
     /// Create a new App instance with the given configuration.
     #[must_use]
     pub fn new(config: crate::config::AppConfig, config_dir: std::path::PathBuf) -> Self {
-        let mut engine = VpnEngine::new(config, config_dir);
+        let mut runtime = VpnRuntime::new(config, config_dir);
 
         // Load metadata and sort
-        engine.load_metadata();
-        engine.sort_profiles();
+        runtime.load_metadata();
+        runtime.sort_profiles();
 
         // Apply user's logging preferences
-        logger::configure(&engine.config.log_level, engine.config.max_log_entries);
+        logger::configure(&runtime.config.log_level, runtime.config.max_log_entries);
 
         let mut app = Self {
-            engine,
+            runtime,
             engine_handle: None,
+            registry: TunnelRegistry::new(),
 
             should_quit: false,
 
@@ -129,7 +196,7 @@ impl App {
             show_bulk_menu: false,
             action_menu_state: ratatui::widgets::ListState::default(),
             config_scroll: 0,
-            cached_config_content: None,
+            cached_config: None,
             search_match_count: 0,
             profile_list_state: TableState::default(),
             panel_areas: HashMap::new(),
@@ -138,7 +205,7 @@ impl App {
         };
 
         // Select first profile if available
-        if !app.engine.profiles.is_empty() {
+        if !app.runtime.profiles.is_empty() {
             app.profile_list_state.select(Some(0));
         }
 
@@ -151,12 +218,12 @@ impl App {
         app.log(constants::MSG_BACKEND_INIT);
 
         {
-            let log_path = app.engine.config_dir.join(constants::LOGS_DIR_NAME);
+            let log_path = app.runtime.config_dir.join(constants::LOGS_DIR_NAME);
             app.log(&format!("IO: Auto-logging to {}", log_path.display()));
         }
 
         // Log kill switch recovery if it happened
-        if app.engine.killswitch_state == crate::state::KillSwitchState::Disabled {
+        if app.runtime.killswitch_state == crate::state::KillSwitchState::Disabled {
             // Check if we recovered from crash — the engine already handled this
         }
 
@@ -178,7 +245,7 @@ impl App {
     pub fn process_external(&mut self) {
         self.process_telemetry();
 
-        while let Ok(msg) = self.engine.cmd_rx.try_recv() {
+        while let Ok(msg) = self.runtime.cmd_rx.try_recv() {
             self.handle_message(msg);
         }
     }
@@ -260,10 +327,11 @@ impl App {
     /// Lightweight constructor for testing.
     #[must_use]
     pub fn new_test() -> Self {
-        let engine = VpnEngine::new_test();
+        let runtime = VpnRuntime::new_test();
         Self {
-            engine,
+            runtime,
             engine_handle: None,
+            registry: TunnelRegistry::new(),
 
             should_quit: false,
 
@@ -282,7 +350,7 @@ impl App {
             show_bulk_menu: false,
             action_menu_state: ratatui::widgets::ListState::default(),
             config_scroll: 0,
-            cached_config_content: None,
+            cached_config: None,
             search_match_count: 0,
             profile_list_state: TableState::default(),
             panel_areas: HashMap::new(),
@@ -294,7 +362,7 @@ impl App {
 
 impl Drop for App {
     fn drop(&mut self) {
-        // VpnEngine's Drop handles kill switch cleanup and VPN process termination.
+        // VpnRuntime's Drop handles kill switch cleanup and VPN process termination.
         // Nothing additional needed here.
     }
 }

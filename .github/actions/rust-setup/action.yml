@@ -1,0 +1,21 @@
+name: 'Rust setup'
+description: 'Install pinned Rust toolchain + restore cargo cache. Callers MUST run actions/checkout@v4 BEFORE this action — a local composite action cannot be discovered on disk until the repo has been checked out.'
+
+inputs:
+  toolchain:
+    description: 'Rust toolchain version (must match rust-toolchain.toml; default mirrors current MSRV pin)'
+    required: false
+    default: '1.91.0'
+  components:
+    description: 'Comma-separated rust-toolchain components (e.g. "clippy" or "rustfmt"). Empty string installs no extras.'
+    required: false
+    default: ''
+
+runs:
+  using: composite
+  steps:
+    - uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: ${{ inputs.toolchain }}
+        components: ${{ inputs.components }}
+    - uses: Swatinem/rust-cache@v2

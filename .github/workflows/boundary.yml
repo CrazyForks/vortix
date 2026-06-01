@@ -1,0 +1,40 @@
+name: Boundary
+
+on:
+  # Doc-only changes skip Boundary — xtask checks grep Rust source for
+  # protocol-binary mentions; markdown can't introduce a leak.
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**/*.md"
+      - "LICENSE"
+      - "CHANGELOG.md"
+  pull_request:
+    branches: [main]
+    paths-ignore:
+      - "**/*.md"
+      - "LICENSE"
+      - "CHANGELOG.md"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  boundary:
+    name: Boundary
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/rust-setup
+      - name: Subprocess boundary (plan 002)
+        run: cargo xtask check-subprocess
+      - name: Platform boundary (plan 003)
+        run: cargo xtask check-platform-leak
+      - name: Protocol boundary (plan 004)
+        run: cargo xtask check-protocol-leak
+      - name: Shell-regression guard (plan 002 U11)
+        run: cargo xtask check-no-shell-regressions

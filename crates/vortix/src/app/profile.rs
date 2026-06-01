@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use super::{App, ConnectionState, InputMode, Protocol, ToastType};
+use super::{App, InputMode, Protocol, ToastType};
 use crate::constants;
 use crate::utils;
 
@@ -10,7 +10,7 @@ impl App {
     pub(crate) fn profile_next(&mut self) {
         let i = match self.profile_list_state.selected() {
             Some(i) => {
-                if i >= self.engine.profiles.len().saturating_sub(1) {
+                if i >= self.runtime.profiles.len().saturating_sub(1) {
                     0
                 } else {
                     i + 1
@@ -25,7 +25,7 @@ impl App {
         let i = match self.profile_list_state.selected() {
             Some(i) => {
                 if i == 0 {
-                    self.engine.profiles.len().saturating_sub(1)
+                    self.runtime.profiles.len().saturating_sub(1)
                 } else {
                     i - 1
                 }
@@ -37,14 +37,8 @@ impl App {
 
     /// Request deletion of a profile (Safety Check)
     pub(crate) fn request_delete(&mut self, idx: usize) {
-        if let Some(profile) = self.engine.profiles.get(idx) {
-            let active_profile = match &self.engine.connection_state {
-                ConnectionState::Connected { profile: p, .. }
-                | ConnectionState::Connecting { profile: p, .. }
-                | ConnectionState::Disconnecting { profile: p, .. } => Some(p.as_str()),
-                ConnectionState::Disconnected => None,
-            };
-            if active_profile == Some(&profile.name) {
+        if let Some(profile) = self.runtime.profiles.get(idx) {
+            if self.is_profile_active(&profile.name) {
                 self.show_toast(
                     "Cannot delete active profile — disconnect first".to_string(),
                     ToastType::Warning,
@@ -63,19 +57,13 @@ impl App {
 
     /// Execute deletion after confirmation
     pub(crate) fn confirm_delete(&mut self, idx: usize) {
-        if idx >= self.engine.profiles.len() {
+        if idx >= self.runtime.profiles.len() {
             return;
         }
 
         // Safety net: state may have changed since the confirm dialog opened
-        if let Some(profile) = self.engine.profiles.get(idx) {
-            let active_profile = match &self.engine.connection_state {
-                ConnectionState::Connected { profile: p, .. }
-                | ConnectionState::Connecting { profile: p, .. }
-                | ConnectionState::Disconnecting { profile: p, .. } => Some(p.as_str()),
-                ConnectionState::Disconnected => None,
-            };
-            if active_profile == Some(&profile.name) {
+        if let Some(profile) = self.runtime.profiles.get(idx) {
+            if self.is_profile_active(&profile.name) {
                 self.show_toast(
                     "Cannot delete — profile became active".to_string(),
                     ToastType::Warning,
@@ -86,12 +74,12 @@ impl App {
         }
 
         // Get profile info before removing
-        let config_path = self.engine.profiles[idx].config_path.clone();
-        let profile_name = self.engine.profiles[idx].name.clone();
-        let protocol = self.engine.profiles[idx].protocol;
+        let config_path = self.runtime.profiles[idx].config_path.clone();
+        let profile_name = self.runtime.profiles[idx].name.clone();
+        let protocol = self.runtime.profiles[idx].protocol;
 
         // Remove from profiles
-        self.engine.profiles.remove(idx);
+        self.runtime.profiles.remove(idx);
 
         // Try to delete from disk
         if config_path.exists() {
@@ -105,12 +93,12 @@ impl App {
         }
 
         // Adjust selection
-        if self.engine.profiles.is_empty() {
+        if self.runtime.profiles.is_empty() {
             self.profile_list_state.select(None);
         } else if let Some(selected) = self.profile_list_state.selected() {
-            if selected >= self.engine.profiles.len() {
+            if selected >= self.runtime.profiles.len() {
                 self.profile_list_state
-                    .select(Some(self.engine.profiles.len() - 1));
+                    .select(Some(self.runtime.profiles.len() - 1));
             }
         }
 
@@ -119,7 +107,7 @@ impl App {
     }
 
     pub(crate) fn rename_profile(&mut self, idx: usize, new_name: &str) {
-        if idx >= self.engine.profiles.len() {
+        if idx >= self.runtime.profiles.len() {
             return;
         }
 
@@ -137,8 +125,8 @@ impl App {
             return;
         }
 
-        let old_name = self.engine.profiles[idx].name.clone();
-        let old_path = self.engine.profiles[idx].config_path.clone();
+        let old_name = self.runtime.profiles[idx].name.clone();
+        let old_path = self.runtime.profiles[idx].config_path.clone();
 
         if let Some(parent) = old_path.parent() {
             let ext = old_path
@@ -159,20 +147,21 @@ impl App {
                 return;
             }
 
-            self.engine.profiles[idx].name = new_name.to_string();
-            self.engine.profiles[idx].config_path = new_file;
+            self.runtime.profiles[idx].name = new_name.to_string();
+            self.runtime.profiles[idx].config_path = new_file;
 
-            if self.engine.last_connected_profile.as_deref() == Some(&old_name) {
-                self.engine.last_connected_profile = Some(new_name.to_string());
+            if self.runtime.last_connected_profile.as_deref() == Some(&old_name) {
+                self.runtime.last_connected_profile = Some(new_name.to_string());
             }
 
-            if let ConnectionState::Connected { profile, .. } = &mut self.engine.connection_state {
-                if *profile == old_name {
-                    *profile = new_name.to_string();
-                }
-            }
+            // Profile renames during active tunnels are blocked at the
+            // overlay open path (`is_profile_active` guard); no
+            // legacy-state mutation needed here post-P5d. The registry
+            // keys by ProfileId derived from name; an active rename
+            // would require re-keying that entry, but rename of an
+            // active profile is refused upstream.
 
-            if matches!(self.engine.profiles[idx].protocol, Protocol::OpenVPN) {
+            if matches!(self.runtime.profiles[idx].protocol, Protocol::OpenVPN) {
                 if let Some(auth) = utils::read_openvpn_saved_auth(&old_name) {
                     let _ = utils::write_openvpn_auth_file(new_name, &auth.0, &auth.1);
                     utils::delete_openvpn_auth_file(&old_name);
@@ -182,7 +171,12 @@ impl App {
             self.save_metadata();
             self.sort_profiles();
 
-            if let Some(new_idx) = self.engine.profiles.iter().position(|p| p.name == new_name) {
+            if let Some(new_idx) = self
+                .runtime
+                .profiles
+                .iter()
+                .position(|p| p.name == new_name)
+            {
                 self.profile_list_state.select(Some(new_idx));
             }
 
@@ -197,7 +191,7 @@ impl App {
         use std::collections::HashMap;
 
         let mut metadata = HashMap::new();
-        for profile in &self.engine.profiles {
+        for profile in &self.runtime.profiles {
             let key = profile.config_path.to_string_lossy().to_string();
             metadata.insert(
                 key,
@@ -213,15 +207,15 @@ impl App {
     /// Sort profiles according to the current `sort_order`.
     pub(crate) fn sort_profiles(&mut self) {
         use crate::state::ProfileSortOrder;
-        match self.engine.sort_order {
+        match self.runtime.sort_order {
             ProfileSortOrder::NameAsc => {
-                self.engine.profiles.sort_by(|a, b| a.name.cmp(&b.name));
+                self.runtime.profiles.sort_by(|a, b| a.name.cmp(&b.name));
             }
             ProfileSortOrder::NameDesc => {
-                self.engine.profiles.sort_by(|a, b| b.name.cmp(&a.name));
+                self.runtime.profiles.sort_by(|a, b| b.name.cmp(&a.name));
             }
             ProfileSortOrder::LastUsed => {
-                self.engine.profiles.sort_by(|a, b| {
+                self.runtime.profiles.sort_by(|a, b| {
                     b.last_used
                         .unwrap_or(std::time::UNIX_EPOCH)
                         .cmp(&a.last_used.unwrap_or(std::time::UNIX_EPOCH))
@@ -234,7 +228,7 @@ impl App {
                         crate::state::Protocol::OpenVPN => 1,
                     }
                 }
-                self.engine.profiles.sort_by(|a, b| {
+                self.runtime.profiles.sort_by(|a, b| {
                     proto_rank(a.protocol)
                         .cmp(&proto_rank(b.protocol))
                         .then_with(|| a.name.cmp(&b.name))
@@ -253,7 +247,7 @@ impl App {
 
         match resolve_target(path_str) {
             Ok(ImportTarget::Url(url)) => {
-                let tx = self.engine.cmd_tx.clone();
+                let tx = self.runtime.cmd_tx.clone();
                 self.show_toast(constants::MSG_DOWNLOADING.to_string(), ToastType::Info);
                 should_close_overlay = false;
 
@@ -289,7 +283,7 @@ impl App {
         self.sort_profiles();
 
         if let Some(name) = last_imported_name {
-            if let Some(idx) = self.engine.profiles.iter().position(|p| p.name == name) {
+            if let Some(idx) = self.runtime.profiles.iter().position(|p| p.name == name) {
                 self.profile_list_state.select(Some(idx));
             }
         }
@@ -304,7 +298,7 @@ impl App {
         match crate::vpn::import_profile(path) {
             Ok(profile) => {
                 let name = profile.name.clone();
-                self.engine.profiles.push(profile);
+                self.runtime.profiles.push(profile);
 
                 self.show_toast(
                     format!("{}{}", constants::MSG_IMPORT_SUCCESS, name),
@@ -341,7 +335,7 @@ impl App {
                     {
                         match crate::vpn::import_profile(&path) {
                             Ok(profile) => {
-                                self.engine.profiles.push(profile);
+                                self.runtime.profiles.push(profile);
                                 imported += 1;
                             }
                             Err(e) => {

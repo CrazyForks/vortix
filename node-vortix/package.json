@@ -1,0 +1,22 @@
+{
+  "name": "@harry-kp/vortix-node",
+  "version": "0.1.0",
+  "description": "Node.js Vortix TUI + CLI",
+  "main": "index.js",
+  "scripts": {
+    "test": "node --test",
+    "start": "node src/index.js",
+    "lint": "node --test"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "bin": {
+    "vortix-node": "src/index.js"
+  },
+  "dependencies": {
+    "blessed": "^0.1.81",
+    "commander": "^15.0.0"
+  }
+}

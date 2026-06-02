@@ -1,11 +1,49 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import dns from 'node:dns/promises';
+import net from 'node:net';
 import { emit } from './output.js';
 import { listProfiles, getProfile, importProfile, deleteProfile, renameProfile } from './profile-store.js';
 import { connectProfile, disconnectProfile, disconnectAll, reconnect, connectionStatus } from './connection-service.js';
-import { telemetrySnapshot } from './telemetry-service.js';
+import { syntheticTelemetrySnapshot } from './telemetry-service.js';
 import { readKillSwitch, writeKillSwitch } from './state-store.js';
 import { KILLSWITCH_MODES } from '../constants.js';
+
+function isPrivateIp(ip) {
+  if (!net.isIP(ip)) return true;
+  if (ip === '127.0.0.1' || ip === '::1' || ip === '169.254.169.254') return true;
+  if (ip.startsWith('10.') || ip.startsWith('192.168.')) return true;
+  if (/^172\.(1[6-9]|2\d|3[0-1])\./.test(ip)) return true;
+  if (ip.startsWith('fc') || ip.startsWith('fd') || ip.startsWith('fe80:')) return true;
+  return false;
+}
+
+async function validateRemoteUrl(input) {
+  const url = new URL(input);
+  if (!['http:', 'https:'].includes(url.protocol)) {
+    throw new Error('Only http/https profile URLs are allowed');
+  }
+  const hostname = url.hostname.toLowerCase();
+  if (
+    hostname === 'localhost' ||
+    hostname.endsWith('.local') ||
+    hostname === 'metadata.google.internal' ||
+    hostname === 'metadata'
+  ) {
+    throw new Error('Refusing localhost/metadata URL');
+  }
+
+  if (net.isIP(hostname)) {
+    if (isPrivateIp(hostname)) throw new Error('Refusing private-network URL');
+    return;
+  }
+
+  const records = await dns.lookup(hostname, { all: true }).catch(() => []);
+  if (records.length === 0) throw new Error('Unable to resolve URL host');
+  if (records.some((record) => isPrivateIp(record.address))) {
+    throw new Error('Refusing URL that resolves to private-network address');
+  }
+}
 
 export async function handleList(paths, options, mode) {
   let profiles = await listProfiles(paths);
@@ -26,6 +64,11 @@ export async function handleList(paths, options, mode) {
 
 export async function handleImport(paths, source, mode) {
   if (/^https?:\/\//.test(source)) {
+    try {
+      await validateRemoteUrl(source);
+    } catch (error) {
+      return emit(mode, 'import', false, null, { code: 'general_error', message: String(error.message ?? error) });
+    }
     const res = await fetch(source);
     if (!res.ok) return emit(mode, 'import', false, null, { code: 'general_error', message: `Download failed: ${res.status}` });
     const content = await res.text();
@@ -97,7 +140,7 @@ export async function handleReconnect(paths, profileName, mode) {
 export async function handleStatus(paths, options, mode) {
   const snapshot = async () => {
     const status = await connectionStatus(paths);
-    const telemetry = await telemetrySnapshot();
+    const telemetry = await syntheticTelemetrySnapshot();
     return { ...status, telemetry };
   };
 

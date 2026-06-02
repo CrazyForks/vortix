@@ -6,6 +6,12 @@ function sanitizeProfileName(name) {
   return name.replace(/\.[^.]+$/, '').replace(/[^a-zA-Z0-9._-]/g, '-');
 }
 
+function assertSafeProfileName(name) {
+  if (!name || name.includes('/') || name.includes('\\') || name.includes('..')) {
+    throw new Error('Invalid profile name');
+  }
+}
+
 function detectProtocol(fileName) {
   if (fileName.endsWith('.conf')) return 'wireguard';
   if (fileName.endsWith('.ovpn')) return 'openvpn';
@@ -78,6 +84,7 @@ export async function importProfile(paths, sourceName, content) {
   const protocol = detectProtocol(sourceName);
   if (!protocol) throw new Error('Unsupported profile format; expected .conf or .ovpn');
   const profileName = sanitizeProfileName(sourceName);
+  assertSafeProfileName(profileName);
   const extension = protocol === 'wireguard' ? '.conf' : '.ovpn';
   const targetFile = `${profileName}${extension}`;
   const targetPath = path.join(paths.profilesDir, targetFile);
@@ -96,6 +103,7 @@ export async function renameProfile(paths, oldName, newName) {
   const current = await getProfile(paths, oldName);
   if (!current) return null;
   const safeName = sanitizeProfileName(newName);
+  assertSafeProfileName(safeName);
   const ext = current.protocol === 'wireguard' ? '.conf' : '.ovpn';
   const targetPath = path.join(paths.profilesDir, `${safeName}${ext}`);
   await fs.rename(current.path, targetPath);

@@ -1,11 +1,14 @@
 import os from 'node:os';
 
-export async function telemetrySnapshot() {
+export async function syntheticTelemetrySnapshot() {
   const interfaces = os.networkInterfaces();
   const ifaceNames = Object.keys(interfaces);
   const activeInterface = ifaceNames.find((name) => name.startsWith('wg') || name.startsWith('tun')) ?? ifaceNames[0] ?? 'unknown';
   const now = Date.now();
 
+  // Placeholder telemetry: timestamp-based modulo arithmetic generates
+  // deterministic, changing values for demo/development sessions until
+  // per-platform socket + interface sampling lands.
   return {
     sampledAt: new Date(now).toISOString(),
     interface: activeInterface,

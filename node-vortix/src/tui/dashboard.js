@@ -1,7 +1,7 @@
 import blessed from 'blessed';
 import { listProfiles } from '../lib/profile-store.js';
 import { connectionStatus, connectProfile, disconnectProfile, reconnect } from '../lib/connection-service.js';
-import { telemetrySnapshot } from '../lib/telemetry-service.js';
+import { syntheticTelemetrySnapshot } from '../lib/telemetry-service.js';
 
 function formatProfileLine(profile, status) {
   const connected = status.connections.find((conn) => conn.profile === profile.name);
@@ -68,7 +68,7 @@ export async function launchDashboard(paths) {
   const render = async () => {
     profiles = await listProfiles(paths);
     status = await connectionStatus(paths);
-    const telemetry = await telemetrySnapshot();
+    const telemetry = await syntheticTelemetrySnapshot();
 
     profileList.setItems(profiles.map((profile) => formatProfileLine(profile, status)));
 
@@ -130,8 +130,18 @@ export async function launchDashboard(paths) {
     await render();
   });
 
+  let renderErrors = 0;
   const timer = setInterval(() => {
-    render().catch((error) => logs.log(`{red-fg}${error.message}{/red-fg}`));
+    render().then(() => {
+      renderErrors = 0;
+    }).catch((error) => {
+      renderErrors += 1;
+      logs.log(`{red-fg}${error.message}{/red-fg}`);
+      if (renderErrors >= 5) {
+        clearInterval(timer);
+        logs.log('{red-fg}Stopped auto-refresh after repeated render failures{/red-fg}');
+      }
+    });
   }, 1_000);
 
   screen.on('destroy', () => clearInterval(timer));

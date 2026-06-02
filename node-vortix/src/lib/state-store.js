@@ -1,5 +1,7 @@
 import fs from 'node:fs/promises';
 
+const VALID_KILLSWITCH_MODES = new Set(['off', 'block-on-drop', 'vpn-only']);
+
 async function readJson(path, fallback) {
   try {
     const raw = await fs.readFile(path, 'utf8');
@@ -30,7 +32,12 @@ export async function writeConnectionState(paths, state) {
 }
 
 export async function readKillSwitch(paths) {
-  return readJson(paths.killSwitchPath, { mode: 'off', armed: false, updatedAt: null });
+  const state = await readJson(paths.killSwitchPath, { mode: 'off', armed: false, updatedAt: null });
+  if (!VALID_KILLSWITCH_MODES.has(state.mode)) {
+    console.warn(`vortix-node: invalid kill-switch mode '${state.mode}' found; resetting to 'off'`);
+    return { mode: 'off', armed: false, updatedAt: state.updatedAt ?? null };
+  }
+  return state;
 }
 
 export async function writeKillSwitch(paths, state) {

@@ -3,7 +3,7 @@ import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { readConnectionState, writeConnectionState } from './state-store.js';
-import { getProfile, listProfiles, markProfileUsed } from './profile-store.js';
+import { getProfile, markProfileUsed } from './profile-store.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -42,6 +42,12 @@ async function disconnectOpenVpn(profile, paths, force = false) {
     const pidRaw = await fs.readFile(pidFile, 'utf8');
     const pid = Number.parseInt(pidRaw.trim(), 10);
     if (Number.isFinite(pid)) {
+      if (process.platform === 'linux') {
+        const cmdline = await fs.readFile(`/proc/${pid}/cmdline`, 'utf8').catch(() => '');
+        if (!cmdline.includes('openvpn')) {
+          throw new Error(`Refusing to signal non-openvpn pid ${pid}`);
+        }
+      }
       process.kill(pid, force ? 'SIGKILL' : 'SIGTERM');
     }
     await fs.unlink(pidFile).catch(() => {});
@@ -161,12 +167,18 @@ export async function reconnect(paths, profileName = null) {
 
 export async function connectionStatus(paths) {
   const state = await readConnectionState(paths);
-  const profiles = await listProfiles(paths);
-  const byName = new Map(profiles.map((profile) => [profile.name, profile]));
+  const settled = await Promise.allSettled(
+    state.connections.map(async (connection) => [connection.profile, await getProfile(paths, connection.profile)]),
+  );
+  const parsedProfiles = new Map(
+    settled
+      .filter((result) => result.status === 'fulfilled')
+      .map((result) => result.value),
+  );
 
   const connections = state.connections.map((connection) => ({
     ...connection,
-    allowedIps: byName.get(connection.profile)?.parsed?.allowedIps ?? [],
+    allowedIps: parsedProfiles.get(connection.profile)?.parsed?.allowedIps ?? [],
   }));
 
   const singleConnection = connections.length === 1 ? connections[0] : null;

@@ -288,13 +288,129 @@ pub fn get_openvpn_auth_path(profile_name: &str) -> std::io::Result<std::path::P
     Ok(auth_dir.join(format!("{safe_name}.auth")))
 }
 
-/// Writes `OpenVPN` credentials to a file (username on line 1, password on line 2).
+/// Build the auth-file body. Line 1 is the username; line 2 is the
+/// plain password. The canonical `<safe>.auth` file is reserved for
+/// non-MFA `auth-user-pass` flows — `OpenVPN` 2.7's static-challenge
+/// path does NOT consume SCRV1 envelopes from this file (the OTP
+/// prompt fires before the file is read; see the U0 spike outcome in
+/// `docs/plans/2026-06-02-001-feat-openvpn-static-challenge-plan.md`).
+/// MFA credentials flow through the transient sibling file (see
+/// [`write_openvpn_scrv1_auth_file`]) and reach openvpn via the
+/// management socket.
+fn format_openvpn_auth_body(username: &str, password: &str) -> String {
+    format!("{username}\n{password}\n")
+}
+
+/// Path of the transient SCRV1 envelope auth file used for
+/// static-challenge connects (plan 2026-06-02-001 U3 / PF-2, #191).
 ///
-/// The file is created with `chmod 600` (owner read/write only) in a single
-/// step via [`crate::vortix_core::secret_file::write_secret_file`], which
-/// uses `openat(2)` against a held parent-directory fd to close the
-/// parent-directory TOCTOU window. If the auth file already exists from a
-/// previous run, it is removed first so the credential rewrite succeeds.
+/// The connect path writes the envelope here, openvpn consumes it via
+/// `--auth-user-pass`, and the protocol layer deletes it immediately
+/// after the daemon fork. The canonical `<safe>.auth` is never
+/// touched during connect — no race window for async callers to lose
+/// against.
+///
+/// # Errors
+///
+/// Returns an error if the auth directory cannot be resolved or created.
+pub fn get_openvpn_scrv1_auth_path(profile_name: &str) -> std::io::Result<std::path::PathBuf> {
+    let root = get_app_config_dir()?;
+    let auth_dir = root.join(crate::constants::OPENVPN_AUTH_DIR);
+
+    if !auth_dir.exists() {
+        create_user_dir(&auth_dir)?;
+    }
+
+    let safe_name = sanitize_profile_name(profile_name);
+    Ok(auth_dir.join(format!("{safe_name}.scrv1.auth")))
+}
+
+/// Write a transient 3-line credentials bundle for the `OpenVPN`
+/// management-socket auth flow (plan 2026-06-02-001, #191, Approach
+/// B-minimal). The protocol layer reads this file, drives the
+/// `--management` socket dance with the embedded user/pass/otp, then
+/// deletes the file. Each line is `<value>` followed by `\n`:
+///
+/// ```text
+/// <username>\n
+/// <password>\n
+/// <otp>\n
+/// ```
+///
+/// This is NOT an `OpenVPN` auth-user-pass file — `OpenVPN` 2.7 doesn't
+/// consult `--auth-user-pass <file>` for the static-challenge case
+/// (the prompt fires before the file is read; see the U0 spike
+/// outcome in the plan). The credentials reach openvpn via the
+/// management socket, not via the file.
+///
+/// # Errors
+///
+/// Returns an error if the file write fails.
+#[cfg(unix)]
+pub fn write_openvpn_scrv1_auth_file(
+    profile_name: &str,
+    username: &str,
+    password: &str,
+    otp: &str,
+) -> std::io::Result<std::path::PathBuf> {
+    use crate::vortix_core::secret_file::{write_secret_file, SecretFileError};
+
+    let auth_path = get_openvpn_scrv1_auth_path(profile_name)?;
+
+    match std::fs::remove_file(&auth_path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+
+    let body = format!("{username}\n{password}\n{otp}\n");
+    write_secret_file(&auth_path, body.as_bytes()).map_err(|e| match e {
+        SecretFileError::Io(io) => io,
+        other => std::io::Error::other(other.to_string()),
+    })?;
+
+    Ok(auth_path)
+}
+
+/// Non-Unix fallback: same 3-line bundle, no chmod.
+#[cfg(not(unix))]
+pub fn write_openvpn_scrv1_auth_file(
+    profile_name: &str,
+    username: &str,
+    password: &str,
+    otp: &str,
+) -> std::io::Result<std::path::PathBuf> {
+    let auth_path = get_openvpn_scrv1_auth_path(profile_name)?;
+    let body = format!("{username}\n{password}\n{otp}\n");
+    write_user_file(&auth_path, body)?;
+    Ok(auth_path)
+}
+
+/// Delete the static-challenge SCRV1 auth file for a profile if present.
+pub fn delete_openvpn_scrv1_auth_file(profile_name: &str) {
+    if let Ok(auth_path) = get_openvpn_scrv1_auth_path(profile_name) {
+        let _ = std::fs::remove_file(&auth_path);
+    }
+}
+
+/// Write the canonical `<safe>.auth` credentials file: line 1 username,
+/// line 2 password, both in plain text.
+///
+/// Reserved for non-MFA `auth-user-pass` profiles. Static-challenge
+/// (MFA) profiles route credentials through a transient sibling file
+/// (see [`write_openvpn_scrv1_auth_file`]) and reach openvpn via the
+/// management socket -- the canonical `.auth` file is never used for
+/// SCRV1 envelopes because `OpenVPN` 2.7's static-challenge path
+/// prompts stdin for the OTP before reading the file (see the U0
+/// spike outcome in
+/// `docs/plans/2026-06-02-001-feat-openvpn-static-challenge-plan.md`).
+///
+/// The file is created with `chmod 600` (owner read/write only) in a
+/// single step via [`crate::vortix_core::secret_file::write_secret_file`],
+/// which uses `openat(2)` against a held parent-directory fd to close
+/// the parent-directory TOCTOU window. If the auth file already
+/// exists from a previous run, it is removed first so the credential
+/// rewrite succeeds.
 ///
 /// # Errors
 ///
@@ -318,7 +434,7 @@ pub fn write_openvpn_auth_file(
         Err(e) => return Err(e),
     }
 
-    let body = format!("{username}\n{password}\n");
+    let body = format_openvpn_auth_body(username, password);
     write_secret_file(&auth_path, body.as_bytes()).map_err(|e| match e {
         SecretFileError::Io(io) => io,
         other => std::io::Error::other(other.to_string()),
@@ -335,7 +451,8 @@ pub fn write_openvpn_auth_file(
     password: &str,
 ) -> std::io::Result<std::path::PathBuf> {
     let auth_path = get_openvpn_auth_path(profile_name)?;
-    write_user_file(&auth_path, format!("{username}\n{password}\n"))?;
+    let body = format_openvpn_auth_body(username, password);
+    write_user_file(&auth_path, body)?;
     Ok(auth_path)
 }
 
@@ -359,6 +476,59 @@ pub fn read_openvpn_saved_auth(profile_name: &str) -> Option<(String, String)> {
 pub fn delete_openvpn_auth_file(profile_name: &str) {
     if let Ok(auth_path) = get_openvpn_auth_path(profile_name) {
         let _ = std::fs::remove_file(&auth_path);
+    }
+}
+
+/// Read a .ovpn config and return the `static-challenge` prompt text if the
+/// directive is present.
+///
+/// Helper for the auth-overlay construction sites that need to know whether
+/// to render a third (OTP) field. Parse-on-demand symmetric with
+/// [`openvpn_config_needs_auth`]: we read the file at use-time rather than
+/// caching the parsed profile on `Profile`. Returns `None` on any read or
+/// parse failure so callers always degrade to the existing two-field flow.
+#[must_use]
+pub fn read_openvpn_static_challenge_prompt(config_path: &std::path::Path) -> Option<String> {
+    let text = std::fs::read_to_string(config_path).ok()?;
+    let parsed = crate::vortix_protocol_openvpn::parser::parse_ovpn_conf(&text).ok()?;
+    parsed.static_challenge.map(|sc| sc.prompt)
+}
+
+/// Scan the `OpenVPN` auth directory and delete any leftover transient
+/// `<safe>.scrv1.auth` credentials bundle (plan 2026-06-02-001 U6, #191).
+///
+/// The bundle is a 3-line `user\npass\notp\n` file the submit handler
+/// writes for the protocol layer to consume at the start of a
+/// static-challenge connect. The protocol layer deletes the file
+/// immediately on read; if it's still on disk at vortix startup,
+/// something crashed mid-connect and the file is now an orphaned
+/// plaintext OTP that should never persist. The OTP would also be
+/// stale (TOTP expires in 30s), so the only correct cleanup is
+/// deletion — the user re-enters credentials on the next connect.
+///
+/// Silently skips files it can't read or delete — the scrubber must
+/// not block app startup. Each deletion is logged at warn level with
+/// the file name (NOT the file contents).
+pub fn scrub_stale_scrv1_auth_files() {
+    let Ok(root) = get_app_config_dir() else {
+        return;
+    };
+    let auth_dir = root.join(crate::constants::OPENVPN_AUTH_DIR);
+    let Ok(entries) = std::fs::read_dir(&auth_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if name.to_ascii_lowercase().ends_with(".scrv1.auth") {
+            tracing::warn!(
+                file = %name,
+                "AUTH: stale credentials bundle — clearing"
+            );
+            let _ = std::fs::remove_file(&path);
+        }
     }
 }
 
@@ -1123,13 +1293,25 @@ mod tests {
 
     // === OpenVPN auth file write/read tests ===
 
-    fn set_temp_config_dir() -> tempfile::TempDir {
+    /// Global mutex serialising any test that mutates the process-wide
+    /// config dir via `set_config_dir`. Without this, parallel test
+    /// execution races on the shared global — one test's write returns
+    /// a path under its temp dir, but a concurrent test resets the
+    /// global before the metadata check, causing the original path to
+    /// resolve to a now-deleted location. Hold the guard for the test's
+    /// full lifetime.
+    static CONFIG_DIR_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn set_temp_config_dir() -> (tempfile::TempDir, std::sync::MutexGuard<'static, ()>) {
+        let guard = CONFIG_DIR_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = tempfile::Builder::new()
             .prefix("vortix_utils_test_")
             .tempdir()
             .unwrap();
         crate::config::set_config_dir(dir.path().to_path_buf());
-        dir
+        (dir, guard)
     }
 
     #[test]
@@ -1166,6 +1348,45 @@ mod tests {
         assert_eq!(perms.mode() & 0o777, 0o600);
 
         delete_openvpn_auth_file(name);
+    }
+
+    #[test]
+    fn auth_file_format_is_username_then_password() {
+        // Byte-for-byte: canonical `<safe>.auth` is always plain
+        // `username\npassword\n`. Static-challenge OTPs go via the
+        // transient sibling file + management socket -- never here.
+        let body = format_openvpn_auth_body("u", "p");
+        assert_eq!(body, "u\np\n");
+    }
+
+    #[test]
+    fn scrub_deletes_scrv1_bundle_and_leaves_canonical_auth_alone() {
+        let _tmp = set_temp_config_dir();
+        // Plain canonical `<safe>.auth` (should survive scrub) and a
+        // transient `<safe>.scrv1.auth` bundle (should be deleted).
+        let plain = write_openvpn_auth_file("scrub-plain", "u", "p").unwrap();
+        let bundle = write_openvpn_scrv1_auth_file("scrub-bundle", "u", "p", "123456").unwrap();
+        assert!(plain.exists());
+        assert!(bundle.exists());
+
+        scrub_stale_scrv1_auth_files();
+
+        assert!(plain.exists(), "canonical .auth file must survive scrub");
+        assert!(
+            !bundle.exists(),
+            ".scrv1.auth bundle must be deleted by scrub"
+        );
+
+        delete_openvpn_auth_file("scrub-plain");
+    }
+
+    #[test]
+    fn scrub_no_op_when_auth_dir_missing() {
+        // Set a temp config dir with no `auth/` subdir created. The scrub
+        // must not panic or error.
+        let _tmp = set_temp_config_dir();
+        scrub_stale_scrv1_auth_files();
+        // No assertion needed — the test passes by not panicking.
     }
 
     #[test]

@@ -286,9 +286,10 @@ impl App {
                 idx,
                 username,
                 password,
+                otp,
                 save,
                 connect_after,
-            } => self.handle_auth_submit(idx, username, password, save, connect_after),
+            } => self.handle_auth_submit(idx, username, password, otp, save, connect_after),
 
             Message::CycleSortOrder => {
                 let selected_name = self
@@ -390,7 +391,18 @@ impl App {
                         ToastType::Info,
                     );
                 } else {
-                    // Pre-fill with existing credentials if saved
+                    // Pre-fill with existing credentials if saved. ManageAuth
+                    // is save-only (`connect_after: false`) so we DO NOT
+                    // surface the OTP field even on static-challenge profiles:
+                    // (1) the OTP is single-use and expires in ~30s, so
+                    // pre-saving has no value; (2) the submit handler writes
+                    // a `.scrv1.auth` bundle whenever `otp.is_some()`, and
+                    // without a connect path consuming it that bundle would
+                    // persist on disk with the plaintext OTP until the next
+                    // startup scrub -- a real leak window. Setting
+                    // static_challenge_prompt=None here keeps the overlay at
+                    // 2 fields (Username/Password) and forces `otp = None`
+                    // in the AuthSubmit message.
                     let (username, password) =
                         utils::read_openvpn_saved_auth(&profile.name).unwrap_or_default();
                     let username_cursor = username.len();
@@ -402,9 +414,12 @@ impl App {
                         username_cursor,
                         password,
                         password_cursor,
+                        otp: String::new(),
+                        otp_cursor: 0,
                         focused_field: crate::state::AuthField::Username,
                         save_credentials: true,
                         connect_after: false,
+                        static_challenge_prompt: None,
                     };
                 }
             }
@@ -647,6 +662,7 @@ impl App {
         idx: usize,
         username: String,
         password: String,
+        otp: Option<String>,
         save: bool,
         connect_after: bool,
     ) {
@@ -666,9 +682,33 @@ impl App {
             return;
         }
 
-        // Write credentials to auth file
-        match utils::write_openvpn_auth_file(&profile_name, &username, &password) {
-            Ok(_) => {
+        // Plan 2026-06-02-001 U3 / PF-2 (#191): write the canonical
+        // `<safe>.auth` exactly once with plain credentials (when
+        // `save=true` or when there's no OTP to save), and write the
+        // single-use SCRV1 envelope to a transient sibling
+        // `<safe>.scrv1.auth` that the protocol layer prefers and
+        // deletes after openvpn forks. This eliminates the race the
+        // earlier "write-SCRV1-then-restore" approach had against the
+        // async connect-worker thread.
+        let result = (|| -> std::io::Result<()> {
+            if save || otp.is_none() {
+                utils::write_openvpn_auth_file(&profile_name, &username, &password)?;
+            }
+            if let Some(ref code) = otp {
+                utils::write_openvpn_scrv1_auth_file(
+                    &profile_name,
+                    &username,
+                    &password,
+                    code.as_str(),
+                )?;
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                // No OTP/SCRV1 content in logs — the OTP value is single-use
+                // and must never appear in tracing spans (plan 2026-06-02-001
+                // PF-8).
                 if save {
                     self.log(&format!("AUTH: Saved credentials for '{profile_name}'"));
                 } else {
@@ -678,7 +718,20 @@ impl App {
                 }
 
                 if connect_after {
-                    self.connect_profile(idx);
+                    // Call the post-auth connect path so the
+                    // static-challenge gate in `connect_profile_inner`
+                    // doesn't re-open the overlay we just closed —
+                    // the OTP is already baked into the transient
+                    // `<safe>.scrv1.auth` file the protocol layer
+                    // consumes during openvpn spawn.
+                    self.connect_profile_after_auth(idx);
+                    // For the one-time-only path (no save), the
+                    // canonical plain auth file must not linger.
+                    // The SCRV1 envelope cleanup happens in the
+                    // protocol layer after openvpn forks.
+                    if otp.is_none() && !save {
+                        utils::delete_openvpn_auth_file(&profile_name);
+                    }
                 } else {
                     // Save-only mode (from ManageAuth)
                     self.show_toast(

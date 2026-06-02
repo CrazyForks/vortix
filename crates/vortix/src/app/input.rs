@@ -110,9 +110,12 @@ impl App {
                 mut username_cursor,
                 mut password,
                 mut password_cursor,
+                mut otp,
+                mut otp_cursor,
                 mut focused_field,
                 mut save_credentials,
                 connect_after,
+                static_challenge_prompt,
             } => {
                 self.handle_input_auth(
                     key,
@@ -122,9 +125,12 @@ impl App {
                     &mut username_cursor,
                     &mut password,
                     &mut password_cursor,
+                    &mut otp,
+                    &mut otp_cursor,
                     &mut focused_field,
                     &mut save_credentials,
                     connect_after,
+                    static_challenge_prompt.as_deref(),
                 );
                 // Update state if still in AuthPrompt mode
                 if let InputMode::AuthPrompt { .. } = self.input_mode {
@@ -135,9 +141,12 @@ impl App {
                         username_cursor,
                         password,
                         password_cursor,
+                        otp,
+                        otp_cursor,
                         focused_field,
                         save_credentials,
                         connect_after,
+                        static_challenge_prompt,
                     };
                 }
             }
@@ -438,8 +447,54 @@ impl App {
             _ => Self::handle_text_field_input(key, path, cursor),
         }
     }
+}
 
+/// Compute the next focused field in the auth overlay's tab cycle.
+///
+/// With `has_otp_field = false` the cycle is Username → Password → `SaveCheckbox` →
+/// Username (today's three-control behaviour). With `has_otp_field = true`
+/// the cycle is Username → Password → Otp → `SaveCheckbox` → Username.
+/// Plan 2026-06-02-001 U3.
+fn next_auth_field(
+    current: &AuthField,
+    key: crossterm::event::KeyCode,
+    has_otp_field: bool,
+) -> AuthField {
+    use crossterm::event::KeyCode;
+    let order: &[AuthField] = if has_otp_field {
+        &[
+            AuthField::Username,
+            AuthField::Password,
+            AuthField::Otp,
+            AuthField::SaveCheckbox,
+        ]
+    } else {
+        &[
+            AuthField::Username,
+            AuthField::Password,
+            AuthField::SaveCheckbox,
+        ]
+    };
+    let Some(idx) = order.iter().position(|f| f == current) else {
+        return AuthField::Username;
+    };
+    let next_idx = match key {
+        // Tab / Down advance to the next field (vertical-stack
+        // navigation: form rows are stacked top-to-bottom).
+        KeyCode::Tab | KeyCode::Down => (idx + 1) % order.len(),
+        // Shift+Tab / Up go to the previous field.
+        KeyCode::BackTab | KeyCode::Up => (idx + order.len() - 1) % order.len(),
+        _ => idx,
+    };
+    order[next_idx].clone()
+}
+
+impl crate::app::App {
     /// Handle keyboard input for the auth credentials overlay.
+    ///
+    /// When `static_challenge_prompt` is `Some`, the overlay carries a third
+    /// (OTP) field bound to `otp` / `otp_cursor` and Tab cycles through four
+    /// fields instead of three (plan 2026-06-02-001 U3).
     #[allow(clippy::too_many_arguments)]
     fn handle_input_auth(
         &mut self,
@@ -450,23 +505,23 @@ impl App {
         username_cursor: &mut usize,
         password: &mut String,
         password_cursor: &mut usize,
+        otp: &mut String,
+        otp_cursor: &mut usize,
         focused_field: &mut AuthField,
         save_credentials: &mut bool,
         connect_after: bool,
+        static_challenge_prompt: Option<&str>,
     ) {
+        let has_otp_field = static_challenge_prompt.is_some();
         match key.code {
             KeyCode::Esc => self.handle_message(Message::CloseOverlay),
-            KeyCode::Tab | KeyCode::BackTab => {
-                // Cycle through fields: Username -> Password -> SaveCheckbox -> Username
-                *focused_field = match (&focused_field, key.code) {
-                    (AuthField::Username, KeyCode::Tab)
-                    | (AuthField::SaveCheckbox, KeyCode::BackTab) => AuthField::Password,
-                    (AuthField::Password, KeyCode::Tab)
-                    | (AuthField::Username, KeyCode::BackTab) => AuthField::SaveCheckbox,
-                    (AuthField::SaveCheckbox, KeyCode::Tab)
-                    | (AuthField::Password, KeyCode::BackTab) => AuthField::Username,
-                    _ => focused_field.clone(),
-                };
+            KeyCode::Tab | KeyCode::BackTab | KeyCode::Down | KeyCode::Up => {
+                // Vertical-stack navigation: rows are stacked top-to-
+                // bottom, so Down/Up move between them; Tab/Shift+Tab
+                // mirror that for users with Tab muscle memory. All
+                // four wrap around the same Username -> Password ->
+                // [Otp ->] SaveCheckbox cycle.
+                *focused_field = next_auth_field(focused_field, key.code, has_otp_field);
             }
             KeyCode::Enter => {
                 // On SaveCheckbox, toggle the checkbox instead of submitting
@@ -474,7 +529,7 @@ impl App {
                     *save_credentials = !*save_credentials;
                     return;
                 }
-                // Require both fields to be non-empty
+                // Require username/password non-empty.
                 if username.is_empty() || password.is_empty() {
                     self.show_toast(
                         "Both username and password are required".to_string(),
@@ -482,10 +537,22 @@ impl App {
                     );
                     return;
                 }
+                // When this profile declares static-challenge, require OTP.
+                // Trim the OTP at submit (covers paste-with-newline).
+                let trimmed_otp = otp.trim().to_string();
+                if has_otp_field && trimmed_otp.is_empty() {
+                    self.show_toast("OTP required".to_string(), ToastType::Warning);
+                    return;
+                }
                 self.handle_message(Message::AuthSubmit {
                     idx: profile_idx,
                     username: username.clone(),
                     password: password.clone(),
+                    otp: if has_otp_field {
+                        Some(trimmed_otp)
+                    } else {
+                        None
+                    },
                     save: *save_credentials,
                     connect_after,
                 });
@@ -498,6 +565,7 @@ impl App {
                 let (text, cursor) = match focused_field {
                     AuthField::Username => (username, username_cursor),
                     AuthField::Password => (password, password_cursor),
+                    AuthField::Otp => (otp, otp_cursor),
                     AuthField::SaveCheckbox => return, // No text editing on checkbox
                 };
                 Self::handle_text_field_input(key, text, cursor);

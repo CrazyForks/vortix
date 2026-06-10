@@ -7,10 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-06-11
+
 ### Highlights
 
 - **Run multiple VPNs at the same time.** Connect to several WireGuard / OpenVPN profiles concurrently; one owns the kernel default route (the *primary*), the rest are *split tunnels* reachable on their declared `AllowedIPs`.
 - **Friendlier kill switch.** Modes are now `off`, `block-on-drop`, and `vpn-only` — the same words in the TUI, the CLI, and the JSON output. The `vpn-only` mode actually stays engaged whether the VPN is up or down (the v0.3.x `AlwaysOn` mode sat unarmed while the VPN was up, leaving a leak window between a drop and reconnect).
+- **systemd-resolved-native DNS on Linux** ([#190](https://github.com/Harry-kp/vortix/issues/190)). On distros where resolved manages DNS (Arch / Omarchy, NixOS-with-resolved, default Fedora Workstation), vortix now registers per-link DNS via `resolvectl` directly — no `systemd-resolvconf` / `openresolv` shim package required.
+- **OpenVPN inline 2FA / static-challenge** ([#191](https://github.com/Harry-kp/vortix/issues/191)). Profiles with `static-challenge "<prompt>" 1` now prompt for the TOTP/PIN at connect time and feed it via the OpenVPN management socket. TUI gets a 3-field form-style auth overlay; CLI prompts inline.
 - **Polished Security Guard panel.** New `Identity` / `Defense` layout, calmer colour treatment, and the encryption row now grades your cipher (`modern AEAD`, `strong`, `deprecated`, or `INSECURE`) instead of just printing the name.
 
 ### Added
@@ -26,6 +30,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Sigil legend (`✓ ✗ ⚠ ─`) in the `?` help overlay.
 - **OpenVPN inline 2FA / static-challenge support (#191).** Profiles that declare `static-challenge "<prompt>" 1` now prompt for the TOTP/PIN at connect time and feed it to the server via the OpenVPN management socket using the SCRV1 envelope (`SCRV1:base64(password):base64(otp)`). Works for both TUI (3-field auth overlay) and CLI (`vortix up <profile>` adds a masked OTP prompt below the password). The static-challenge `0` variant (cleartext echo) is intentionally unsupported.
 - Auth overlay redesigned as a form: fixed-width label column, single `▸` focus marker, and `Up`/`Down` arrows now cycle between Username / Password / OTP / Save-checkbox in a circular loop (Tab/BackTab still work for muscle-memory). Empty values render an em-dash placeholder; passwords and OTPs mask to filled-circle dots.
+- **systemd-resolved DNS integration on Linux (#190).** When `is_systemd_resolved()` is detected and `resolvectl` works, vortix calls `resolvectl dns <iface> <ips>` (and `resolvectl domain <iface> ~.` for primary tunnels) directly after `wg-quick up` succeeds. The connect path strips `DNS = …` from the wg-quick-fed temp config so wg-quick never tries its own resolvconf path. Result: a fresh Arch / Omarchy / NixOS-with-resolved / default-Fedora host now connects WG-with-DNS without needing the `systemd-resolvconf` or `openresolv` shim package — the historic "Missing dependencies: resolvconf (systemd)" wall is gone. Secondary tunnels also get per-link DNS registered (non-authoritative — DNS reachable on the link but doesn't claim the catchall), strictly better than v0.3.x's "strip-and-discard" behaviour.
 
 ### Changed
 
@@ -37,6 +42,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Telemetry switched from `reqwest` / `curl` / `ping` shell-outs to in-process HTTP (`ureq`) + raw-ICMP (`socket2`). Smaller binary, faster startup, no transient child processes.
 - Interface and process lookups on Linux / macOS go through `libc` directly (`getifaddrs`, `sysctlbyname`, `kill`) instead of parsing `ip addr show` / `ifconfig` / `ps` output. Fewer locale-dependent parser bugs.
 - Default OpenVPN connect timeout bumped from 20s → 35s to accommodate the static-challenge MFA flow (TLS handshake + PAM verification + `PUSH_REPLY` can comfortably exceed 20s on geographically distant servers).
+- **MSRV bumped from 1.75 to 1.85.** A transitive dep (`idna_adapter`) requires `edition2024`, which Rust 1.75 doesn't support. Distros shipping older Rust — notably Ubuntu 24.04's apt — will need `rustup` for source builds; `curl | sh` installer users get a prebuilt binary as before.
+- **Missing-dependency error formatting.** When the WG dep-check fires, `wg` and `wg-quick` now report under a single label (`wireguard-tools`) and produce one install hint instead of duplicating the per-distro lines. Same for OpenVPN — gets a proper three-distro hint instead of falling through to the apt-or-dnf-only fallback. Vestigial `curl` binary check removed from startup (telemetry has been in-process HTTP since the `ureq`/`socket2` switch above).
 
 ### Fixed
 
@@ -52,6 +59,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - New observability: any `Message` handler that holds the UI thread for more than 50ms emits a `tracing::warn` (silent by default; turn on with `RUST_LOG=vortix::app=warn`). Future regressions of this class surface immediately instead of being chased down with ad-hoc instrumentation.
 - CLI → TUI handoff for OpenVPN tunnels (#191). When a profile was connected via `vortix up` and the TUI then opened, the sidebar sigil flashed grey (`external` — i.e. "not started by vortix") because the scanner couldn't authoritatively resolve the kernel interface from the running `openvpn` process. The scanner now reads the per-profile log file as Method 0 (platform-neutral, runs ahead of the lsof/ifconfig methods) and extracts the kernel interface via the existing `parse_kernel_interface` parser. Result: vortix-started tunnels render with the correct vortix-owned sigil regardless of which entry point launched them.
 - Manage-credentials save-only path no longer writes a plaintext-OTP `.scrv1.auth` bundle to disk. The dead `static_challenge_prompt` field is now explicitly cleared in the ManageAuth handler so the save path takes the username/password-only branch even when the profile declares a static-challenge directive.
+- **TUI rendering no longer scrambled by config-ownership notes** ([#222](https://github.com/Harry-kp/vortix/pull/222)). `fix_ownership()` was writing `Note: could not set ownership of …` directly to stderr via `eprintln!`, which corrupted ratatui's alternate-screen rendering when running as direct root (no sudo). Now routes through `tracing::debug!` (SUDO_UID-unset case — chown is structurally impossible, no operator action needed) or `tracing::warn!` (real chown failures), both via the existing tracing infrastructure.
 
 ### Removed
 

@@ -113,16 +113,14 @@ impl App {
     pub(crate) fn check_system_dependencies(&mut self) {
         let mut missing: Vec<&str> = Vec::new();
 
-        if !utils::binary_exists("curl") {
-            missing.push("curl");
-        }
-
         if !utils::binary_exists("openvpn") {
             missing.push("openvpn");
         }
 
-        if !utils::binary_exists("wg-quick") {
-            missing.push("wg-quick");
+        // wg / wg-quick both ship in wireguard-tools — single label so the
+        // install hint doesn't duplicate when both are absent.
+        if !utils::binary_exists("wg-quick") || !utils::binary_exists("wg") {
+            missing.push("wireguard-tools");
         }
 
         if missing.is_empty() {

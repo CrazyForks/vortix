@@ -4,6 +4,27 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-06-10
+
+### Bug Fixes
+
+- **config:** Route fix_ownership messages through tracing, not eprintln ([#222](https://github.com/Harry-kp/vortix/pull/222))
+
+### Features
+
+- Multi-tunnel VPN + state-authority + system-dep reduction + UX overhaul ([#214](https://github.com/Harry-kp/vortix/pull/214))
+- **openvpn:** Static-challenge / inline-TOTP support (closes #191) ([#215](https://github.com/Harry-kp/vortix/pull/215))
+- **linux:** Systemd-resolved DNS integration (closes #190) ([#218](https://github.com/Harry-kp/vortix/pull/218))
+
+### Miscellaneous
+
+- **deps:** Bump sha2 from 0.10.9 to 0.11.0 ([#209](https://github.com/Harry-kp/vortix/pull/209))
+- **deps:** Bump rand from 0.8.6 to 0.10.1 ([#211](https://github.com/Harry-kp/vortix/pull/211))
+- **deps:** Bump socket2 from 0.5.10 to 0.6.3 ([#221](https://github.com/Harry-kp/vortix/pull/221))
+- **deps:** Bump sha2 from 0.10.9 to 0.11.0 ([#220](https://github.com/Harry-kp/vortix/pull/220))
+
+
+
 ### Highlights
 
 - **Run multiple VPNs at the same time.** Connect to several WireGuard / OpenVPN profiles concurrently; one owns the kernel default route (the *primary*), the rest are *split tunnels* reachable on their declared `AllowedIPs`.

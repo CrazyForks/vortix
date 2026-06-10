@@ -240,7 +240,7 @@ fn get_peer_uid(stream: &UnixStream) -> std::io::Result<u32> {
                 libc::SOL_SOCKET,
                 libc::SO_PEERCRED,
                 std::ptr::addr_of_mut!(cred).cast::<libc::c_void>(),
-                &mut len,
+                std::ptr::from_mut(&mut len),
             );
             if rc != 0 {
                 return Err(std::io::Error::last_os_error());

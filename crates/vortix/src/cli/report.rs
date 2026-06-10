@@ -246,7 +246,7 @@ fn uname_release() -> Option<String> {
     #[allow(unsafe_code)]
     unsafe {
         let mut buf: libc::utsname = std::mem::zeroed();
-        if libc::uname(&mut buf) != 0 {
+        if libc::uname(std::ptr::from_mut(&mut buf)) != 0 {
             return None;
         }
         // `release` is a fixed-size C char array; convert to &str via
@@ -628,7 +628,7 @@ fn build_github_url(body: &str) -> String {
     let mut best_url = base_prefix.clone();
 
     while low <= high {
-        let mid = (low + high) / 2;
+        let mid = usize::midpoint(low, high);
 
         let candidate_raw: String = body_chars.iter().take(mid).collect();
         let candidate_with_suffix = format!("{candidate_raw}{suffix}");

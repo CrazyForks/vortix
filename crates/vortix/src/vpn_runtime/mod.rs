@@ -560,10 +560,10 @@ impl VpnRuntime {
         let mut missing = Vec::new();
         match protocol {
             Protocol::WireGuard => {
-                if !utils::binary_exists("wg-quick") {
-                    missing.push("wg-quick".to_string());
-                }
-                if !utils::binary_exists("wg") {
+                // Both `wg` and `wg-quick` ship in the wireguard-tools
+                // package on every supported distro — report them under
+                // a single label so the install hint isn't duplicated.
+                if !utils::binary_exists("wg-quick") || !utils::binary_exists("wg") {
                     missing.push("wireguard-tools".to_string());
                 }
                 // On Linux, wg-quick uses `resolvconf` to set DNS when the

@@ -258,7 +258,11 @@ fn get_peer_uid(stream: &UnixStream) -> std::io::Result<u32> {
         unsafe {
             let mut uid: libc::uid_t = 0;
             let mut gid: libc::gid_t = 0;
-            let rc = libc::getpeereid(fd, &mut uid, &mut gid);
+            let rc = libc::getpeereid(
+                fd,
+                std::ptr::from_mut(&mut uid),
+                std::ptr::from_mut(&mut gid),
+            );
             if rc != 0 {
                 return Err(std::io::Error::last_os_error());
             }

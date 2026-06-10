@@ -99,7 +99,7 @@ If you use Vortix on Linux and hit a problem, please open an issue and include `
 
 ### Build dependencies (source installs only)
 
-- Rust 1.75+
+- Rust 1.85+ (for `edition2024` transitive deps; distros shipping older Rust — e.g. Ubuntu 24.04's apt — will need `rustup` for source builds)
 - macOS 12+ or Linux kernel 3.10+ (5.6+ recommended for native WireGuard)
 
 ### Quick install commands

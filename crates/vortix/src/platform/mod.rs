@@ -88,12 +88,27 @@ sudo apt install openresolv  # Debian/Ubuntu\n\
 sudo pacman -S openresolv    # Arch\n\
 sudo dnf install openresolv  # Fedora"
             .to_string(),
-        // WireGuard binaries are shipped by the wireguard-tools package.
-        "wg" | "wg-quick" => "\
+        // WireGuard binaries (wg, wg-quick) and the package itself all
+        // share the same install hint — both binaries ship in the
+        // wireguard-tools package on every supported distro.
+        "wg" | "wg-quick" | "wireguard-tools" => "\
 sudo apt install wireguard-tools  # Debian/Ubuntu\n\
 sudo pacman -S wireguard-tools    # Arch\n\
 sudo dnf install wireguard-tools  # Fedora"
             .to_string(),
-        _ => format!("sudo apt install {pkg}  # or: sudo dnf install {pkg}"),
+        // OpenVPN ships under its eponymous package everywhere.
+        "openvpn" => "\
+sudo apt install openvpn  # Debian/Ubuntu\n\
+sudo pacman -S openvpn    # Arch\n\
+sudo dnf install openvpn  # Fedora"
+            .to_string(),
+        // Unknown package: best-effort generic hint (the calling code
+        // should add a specific case above before relying on this).
+        _ => format!(
+            "\
+sudo apt install {pkg}  # Debian/Ubuntu\n\
+sudo pacman -S {pkg}    # Arch\n\
+sudo dnf install {pkg}  # Fedora"
+        ),
     }
 }

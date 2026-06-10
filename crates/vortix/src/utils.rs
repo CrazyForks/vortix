@@ -620,7 +620,8 @@ fn format_system_time_inner(time: std::time::SystemTime) -> Option<String> {
     // time_t is i64 on most platforms; u64→i64 is safe until year 2262
     #[allow(clippy::cast_possible_wrap)]
     let time_t = secs as libc::time_t;
-    let result = unsafe { libc::localtime_r(&time_t, &mut tm) };
+    let result =
+        unsafe { libc::localtime_r(std::ptr::from_ref(&time_t), std::ptr::from_mut(&mut tm)) };
     if result.is_null() {
         return None;
     }

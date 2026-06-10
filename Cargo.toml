@@ -6,7 +6,7 @@ default-members = ["crates/vortix"]
 [workspace.package]
 version = "0.3.1"
 edition = "2021"
-rust-version = "1.75"
+rust-version = "1.85"
 license = "MIT"
 repository = "https://github.com/Harry-kp/vortix"
 authors = ["Harry KP <harrykp@users.noreply.github.com>"]

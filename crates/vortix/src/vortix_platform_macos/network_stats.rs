@@ -44,7 +44,7 @@ fn get_total_bytes_via_getifaddrs() -> Option<(u64, u64)> {
             if let Some(name_cstr) = entry
                 .ifa_name
                 .as_ref()
-                .map(|p| std::ffi::CStr::from_ptr(p as *const _))
+                .map(|p| std::ffi::CStr::from_ptr(std::ptr::from_ref(p).cast()))
             {
                 if !entry.ifa_data.is_null() && !is_loopback(name_cstr.to_bytes()) {
                     let data = entry.ifa_data.cast::<libc::if_data>();

@@ -886,6 +886,19 @@ cmd_up() {
             *)          die "Unknown flavor: ${flavor}. Available: ${ALL_FLAVORS[*]}" ;;
         esac
 
+        # Pre-flight: cloud-init's YAML parser silently drops the entire
+        # user-data block when it encounters a non-ASCII character (em-dash,
+        # smart quote, etc.). The droplet then boots without the requested
+        # services and looks "running" but does nothing useful. Fail loud
+        # here instead so the author sees the bad byte before paying for
+        # the droplet.
+        if LC_ALL=C grep -nP '[^\x00-\x7F]' "$cloud_init_file" >/dev/null; then
+            warn "Non-ASCII byte(s) in ${flavor} cloud-init — would fail cloud-init YAML parse:"
+            LC_ALL=C grep -nP '[^\x00-\x7F]' "$cloud_init_file" | head -5 >&2
+            rm -f "$cloud_init_file"
+            die "Replace em-dashes / smart-quotes with ASCII equivalents in cloudinit_${flavor//-/_}() and retry."
+        fi
+
         doctl compute droplet create "$name" \
             --region "$REGION" \
             --size "$SIZE" \
@@ -985,12 +998,52 @@ cmd_profiles() {
 cmd_down() {
     require_cmd doctl
 
-    if [[ ! -f "$SESSION_FILE" ]]; then
-        die "No active session."
+    local sid
+    if [[ -f "$SESSION_FILE" ]]; then
+        sid=$(session_id)
+    else
+        # Session file gone (cleared between sessions, lost in $TMPDIR rotation,
+        # etc.) but droplets may still be alive — they're tagged. Discover any
+        # orphaned vortix-test-* sessions and offer to tear them down so a
+        # stranded session can't silently burn DO budget.
+        warn "No session file at ${SESSION_FILE}."
+        # `grep || true` keeps `set -e -o pipefail` happy when no droplets
+        # match — empty stdout means "no orphans," not a script-killing error.
+        local orphan_tags
+        orphan_tags=$(doctl compute droplet list \
+            --format Tags --no-header \
+            | tr ',' '\n' \
+            | { grep -E '^vortix-test-[0-9]+$' || true; } \
+            | sort -u)
+        if [[ -z "$orphan_tags" ]]; then
+            info "No vortix-test-* droplets found on this account either. Nothing to do."
+            return 0
+        fi
+        info "Found orphan session(s) tagged on this account:"
+        while IFS= read -r tag; do
+            local count
+            count=$(doctl compute droplet list --tag-name "$tag" --format ID --no-header | wc -l | tr -d ' ')
+            printf '    %s (%s droplet(s))\n' "$tag" "$count"
+        done <<< "$orphan_tags"
+        printf '\nTear down all of the above? [y/N] '
+        read -r answer
+        if [[ ! "$answer" =~ ^[Yy]$ ]]; then
+            die "Aborted. Use \`doctl compute droplet delete --tag-name <tag> --force\` to remove a specific session by hand."
+        fi
+        # Delete by each tag and exit — no session file to clean up.
+        while IFS= read -r tag; do
+            local ids
+            ids=$(doctl compute droplet list --tag-name "$tag" --format ID --no-header | tr '\n' ' ')
+            if [[ -n "${ids// /}" ]]; then
+                info "Deleting droplets tagged ${tag}: ${ids}"
+                # shellcheck disable=SC2086
+                doctl compute droplet delete $ids --force
+            fi
+        done <<< "$orphan_tags"
+        ok "Orphan sessions destroyed"
+        return 0
     fi
 
-    local sid
-    sid=$(session_id)
     info "Tearing down session: ${sid}"
 
     local ids

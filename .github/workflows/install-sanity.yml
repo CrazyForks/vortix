@@ -46,12 +46,22 @@ jobs:
       - name: Install Homebrew (Linux only — macOS ships it)
         if: matrix.method == 'homebrew' && runner.os == 'Linux'
         run: |
+          # Homebrew on Linux now sandboxes installs via bubblewrap. The
+          # default ubuntu-latest runner doesn't ship it, so brew install
+          # bails with "Bubblewrap is required to use the Linux sandbox
+          # but was not found." Install bwrap before bootstrapping brew.
+          sudo apt-get update -qq && sudo apt-get install -y bubblewrap
           /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
           echo "/home/linuxbrew/.linuxbrew/bin" >> "$GITHUB_PATH"
 
       - name: Install via cargo install (crates.io)
         if: matrix.method == 'cargo-install'
-        run: cargo install vortix
+        # `--locked` respects vortix's published Cargo.lock. Without it,
+        # cargo's resolver picks the latest semver-compatible version of
+        # every transitive dep at install time, which has hit upstream
+        # build breaks (e.g. `time` v0.3.x → E0119 trait conflict on
+        # certain feature combos). Locked installs are reproducible.
+        run: cargo install --locked vortix
 
       - name: Install via shell installer (latest release)
         if: matrix.method == 'shell-installer'

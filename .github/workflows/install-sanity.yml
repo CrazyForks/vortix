@@ -47,12 +47,18 @@ jobs:
         if: matrix.method == 'homebrew' && runner.os == 'Linux'
         run: |
           # Homebrew on Linux now sandboxes installs via bubblewrap. The
-          # default ubuntu-latest runner doesn't ship it, so brew install
-          # bails with "Bubblewrap is required to use the Linux sandbox
-          # but was not found." Install bwrap before bootstrapping brew.
+          # default ubuntu-latest runner doesn't ship bwrap AND its
+          # AppArmor profile blocks unprivileged user namespaces — so
+          # even after installing bwrap, the rootless sandbox fails
+          # with "Bubblewrap is installed but cannot create a rootless
+          # sandbox." Homebrew's own error message documents
+          # `HOMEBREW_NO_SANDBOX_LINUX=1` as the workaround. Real
+          # users hitting this either configure the sysctls or set
+          # this env var; setting it here replicates the latter path.
           sudo apt-get update -qq && sudo apt-get install -y bubblewrap
           /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
           echo "/home/linuxbrew/.linuxbrew/bin" >> "$GITHUB_PATH"
+          echo "HOMEBREW_NO_SANDBOX_LINUX=1" >> "$GITHUB_ENV"
 
       - name: Install via cargo install (crates.io)
         if: matrix.method == 'cargo-install'

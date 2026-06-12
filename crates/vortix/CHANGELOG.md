@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-06-12
+
+### Fixed
+
+- **`cargo install vortix` now compiles on a clean cargo cache.** The `time` crate published version `0.3.48` on the same day v0.4.0 shipped, and it carries a fresh `error[E0119]: conflicting implementations of trait From<...>` build break. Without `--locked`, cargo's resolver was happily picking the broken `time 0.3.48` for every user typing the canonical `cargo install vortix` command. Capped our workspace `time` dep at `<0.3.48` so the resolver can't reach the broken version; the lockfile already pinned the working `0.3.47`. Drop the cap once upstream releases a clean `0.3.49+`.
+
+
+
 ## [0.4.0] - 2026-06-11
 
 ### Highlights

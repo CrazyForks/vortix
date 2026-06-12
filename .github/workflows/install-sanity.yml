@@ -56,12 +56,14 @@ jobs:
 
       - name: Install via cargo install (crates.io)
         if: matrix.method == 'cargo-install'
-        # `--locked` respects vortix's published Cargo.lock. Without it,
-        # cargo's resolver picks the latest semver-compatible version of
-        # every transitive dep at install time, which has hit upstream
-        # build breaks (e.g. `time` v0.3.x → E0119 trait conflict on
-        # certain feature combos). Locked installs are reproducible.
-        run: cargo install --locked vortix
+        # Intentionally NOT using --locked. This workflow exists to
+        # replicate the literal command a real end user types — if
+        # cargo's resolver can pick a broken transitive dep version,
+        # we want to see that here (and respond by capping the dep in
+        # our own Cargo.toml), NOT silence it with --locked. See
+        # commit 18bcf24 for the `time 0.3.48` case that motivated
+        # this comment.
+        run: cargo install vortix
 
       - name: Install via shell installer (latest release)
         if: matrix.method == 'shell-installer'

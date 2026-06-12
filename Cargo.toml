@@ -17,7 +17,12 @@ ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 crossterm = "0.29"
 
 # Date/time formatting (local-offset needed for OffsetDateTime::now_local)
-time = { version = "0.3", features = ["local-offset", "formatting", "macros"] }
+# Upper bound excludes time 0.3.48 (published 2026-06-12) which ships
+# a fresh E0119 trait-conflict that breaks `cargo install vortix` for
+# anyone without `--locked`. Drop the cap once upstream releases a
+# clean 0.3.49+ — until then, pinning here keeps the canonical install
+# command working for end users on crates.io.
+time = { version = ">=0.3, <0.3.48", features = ["local-offset", "formatting", "macros"] }
 
 # Error Handling
 color-eyre = "0.6"

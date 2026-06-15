@@ -891,13 +891,28 @@ cmd_up() {
         # smart quote, etc.). The droplet then boots without the requested
         # services and looks "running" but does nothing useful. Fail loud
         # here instead so the author sees the bad byte before paying for
-        # the droplet.
-        if LC_ALL=C grep -nP '[^\x00-\x7F]' "$cloud_init_file" >/dev/null; then
+        # the droplet. Python is portable across BSD/GNU userlands; the
+        # earlier `grep -nP` approach was GNU-only.
+        if ! python3 -c "
+import sys
+bad = []
+with open(sys.argv[1], 'rb') as f:
+    for lineno, line in enumerate(f, 1):
+        if any(b > 0x7f for b in line):
+            bad.append((lineno, line))
+if bad:
+    for lineno, line in bad[:5]:
+        try: text = line.decode('utf-8', errors='replace').rstrip()
+        except Exception: text = '<unprintable>'
+        sys.stderr.write(f'{lineno}: {text}\n')
+    sys.exit(1)
+" "$cloud_init_file" 2>/tmp/vortix-cloudinit-ascii-check.log; then
             warn "Non-ASCII byte(s) in ${flavor} cloud-init — would fail cloud-init YAML parse:"
-            LC_ALL=C grep -nP '[^\x00-\x7F]' "$cloud_init_file" | head -5 >&2
-            rm -f "$cloud_init_file"
+            cat /tmp/vortix-cloudinit-ascii-check.log >&2
+            rm -f "$cloud_init_file" /tmp/vortix-cloudinit-ascii-check.log
             die "Replace em-dashes / smart-quotes with ASCII equivalents in cloudinit_${flavor//-/_}() and retry."
         fi
+        rm -f /tmp/vortix-cloudinit-ascii-check.log
 
         doctl compute droplet create "$name" \
             --region "$REGION" \

@@ -1910,6 +1910,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ratatui-flip-panel"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ed2539e91d41615fca6b61254a8e7e8348abd68eb9bbc244a466a30719d7a8b7"
+dependencies = [
+ "ratatui-core",
+]
+
+[[package]]
 name = "ratatui-macros"
 version = "0.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2879,6 +2888,7 @@ dependencies = [
  "libc",
  "open",
  "ratatui",
+ "ratatui-flip-panel",
  "serde",
  "serde_json",
  "sha2 0.11.0",

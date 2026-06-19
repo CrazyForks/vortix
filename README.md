@@ -1,6 +1,7 @@
 # Vortix
 
-[![CI](https://github.com/Harry-kp/vortix/actions/workflows/ci.yml/badge.svg)](https://github.com/Harry-kp/vortix/actions/workflows/ci.yml)
+[![Test](https://github.com/Harry-kp/vortix/actions/workflows/test.yml/badge.svg)](https://github.com/Harry-kp/vortix/actions/workflows/test.yml)
+[![Lint](https://github.com/Harry-kp/vortix/actions/workflows/lint.yml/badge.svg)](https://github.com/Harry-kp/vortix/actions/workflows/lint.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://github.com/Harry-kp/vortix/blob/main/LICENSE)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/Harry-kp/vortix/blob/main/CONTRIBUTING.md)
 [![Crates.io](https://img.shields.io/crates/v/vortix.svg)](https://crates.io/crates/vortix)
@@ -17,24 +18,37 @@
 
 Terminal UI for WireGuard and OpenVPN with real-time telemetry and leak guarding.
 
-> **New in v0.4.0 — multi-tunnel.** Run multiple VPN tunnels at the
-> same time; one owns the kernel default route (the *primary*), the
-> rest are *addressable* on their declared `AllowedIPs`. Per-profile
-> retry and auto-reconnect. Scanner auto-adopts externally-started
-> tunnels. JSON status envelope bumps to `schema_version: 2` with
-> `data.connections[]` + `data.primary`. Kill switch **VPN-only** mode
-> now keeps the firewall engaged whether the VPN is up or down
-> (canonical Linux killswitch shape — closes a
-> gap-between-drop-and-reconnect leak path). See the
-> [CHANGELOG](https://github.com/Harry-kp/vortix/blob/main/CHANGELOG.md) for the full list.
->
-> **v0.3.0 migration** (Engine FSM, session journal, encrypted secret store):
->
-> - [Release notes](https://github.com/Harry-kp/vortix/blob/main/docs/v0.3.0-RELEASE-NOTES.md) — what changed (60s read)
-> - [Upgrade guide](https://github.com/Harry-kp/vortix/blob/main/docs/MIGRATION.md) — for v0.2.x users
-> - [FAQ](https://github.com/Harry-kp/vortix/blob/main/docs/v0.3.0-FAQ.md) — common upgrade questions
-
 ![Vortix Demo](https://raw.githubusercontent.com/Harry-kp/vortix/main/assets/demo.gif)
+
+<details>
+<summary><b>More scenarios — click to expand</b></summary>
+
+<br>
+
+<table>
+  <tr>
+    <td align="center" width="50%" valign="top">
+      <b>multi-connection</b><br>
+      <img src="https://raw.githubusercontent.com/Harry-kp/vortix/main/assets/multi-connection.gif" alt="multi-connection demo" />
+    </td>
+    <td align="center" width="50%" valign="top">
+      <b>leak detection</b><br>
+      <img src="https://raw.githubusercontent.com/Harry-kp/vortix/main/assets/leak-detection.gif" alt="leak detection demo" />
+    </td>
+  </tr>
+  <tr>
+    <td align="center" width="50%" valign="top">
+      <b>split tunnel</b><br>
+      <img src="https://raw.githubusercontent.com/Harry-kp/vortix/main/assets/split-tunnel.gif" alt="split tunnel demo" />
+    </td>
+    <td align="center" width="50%" valign="top">
+      <b>profile management</b><br>
+      <img src="https://raw.githubusercontent.com/Harry-kp/vortix/main/assets/profile-management.gif" alt="profile management demo" />
+    </td>
+  </tr>
+</table>
+
+</details>
 
 ## Why Vortix?
 
@@ -327,9 +341,13 @@ vortix status --watch --json
 | `v` | View Profile Configuration |
 | `y` | Copy Public IP to Clipboard |
 | `K` | Toggle Kill Switch (Shift+K) |
+| `R` | Rename Profile (Shift+R) |
+| `s` | Cycle Profile Sort Order (Sidebar) |
+| `f` | Flip Panel (Chart / Connection Details / Security) — back face shows alternate view. Inside Event Log, cycles the log-level filter. |
 | `z` | Toggle Zoom View (Panel) |
 | `x` | Open Action Menu (Contextual) |
 | `b` | Open Bulk Menu |
+| `?` | Open Help Overlay (Tab cycles sections) |
 | `Del` | Delete Profile (Sidebar) |
 | `q` | Quit Application |
 

@@ -591,6 +591,37 @@ impl Tunnel for OvpnTunnel {
         if let Some(parent) = pid_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
+
+        // Refuse double-up: if the pidfile records a live daemon, a second
+        // spawn would orphan it (--writepid last-write-wins clobbers the
+        // record `down` uses for teardown). Dead-pid files fall through to
+        // the stale cleanup below.
+        #[cfg(unix)]
+        if let Ok(content) = std::fs::read_to_string(&pid_path) {
+            if let Some(existing_pid) = content
+                .trim()
+                .parse::<u32>()
+                .ok()
+                .and_then(|p| libc::pid_t::try_from(p).ok())
+            {
+                // SAFETY: kill(pid, 0) is a pure existence probe — no signal
+                // delivered, no buffers. Same invariant analysis as the
+                // SIGTERM teardown below. EPERM means the process exists but
+                // is owned elsewhere — treat as alive (refuse the spawn).
+                #[allow(unsafe_code)]
+                let rc = unsafe { libc::kill(existing_pid, 0) };
+                let alive =
+                    rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+                if alive {
+                    return Err(TunnelError::Subprocess(format!(
+                        "OpenVPN for '{}' is already running (pid {existing_pid}) — \
+                         disconnect it first with `vortix down`",
+                        profile.display_name
+                    )));
+                }
+            }
+        }
+
         // Stale-file cleanup from any previous run.
         let _ = std::fs::remove_file(&pid_path);
         let _ = std::fs::remove_file(&log_path);
